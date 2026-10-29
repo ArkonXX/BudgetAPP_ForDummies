@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useI18n, type Key } from "./i18n";
-import { money, monthLabel, moneyInput, parseMoney } from "./format";
-import { addMonths } from "../shared/period";
+import { dateLabel, money, monthLabel, moneyInput, parseMoney } from "./format";
+import { addMonths, todayISO } from "../shared/period";
 import { Icon } from "./icons";
 import { api } from "./api";
 import { useApp } from "./App";
@@ -73,6 +73,22 @@ export function MonthNav({ month, onChange }: { month: string; onChange: (m: str
       </button>
     </div>
   );
+}
+
+/** " · scheduled" before its day, " · to confirm" once the day has come: it doesn't count yet. */
+export function ScheduledTag({ date }: { date: string }) {
+  const { t } = useI18n();
+  return date > todayISO() ? (
+    <span className="tag-upcoming"> · {t("scheduledTag")}</span>
+  ) : (
+    <span className="neg"> · {t("toConfirmTag")}</span>
+  );
+}
+
+/** Under a date field: a date after today only counts once confirmed on that day. */
+export function ScheduledHint({ date }: { date: string }) {
+  const { t, lang } = useI18n();
+  return date > todayISO() ? <p className="muted small">{t("scheduledHelp", { date: dateLabel(date, lang) })}</p> : null;
 }
 
 export function Money({ cents, signed }: { cents: number; signed?: boolean }) {

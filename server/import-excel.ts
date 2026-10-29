@@ -8,7 +8,7 @@
 
 import ExcelJS from "exceljs";
 import type { DB } from "./db.ts";
-import { tx } from "./db.ts";
+import { tiePlanLines, tx } from "./db.ts";
 import {
   ensureCategory,
   ensurePot,
@@ -305,6 +305,7 @@ export async function importWorkbook(db: DB, data: Buffer | ArrayBuffer): Promis
         });
         report.loans++;
       }
+      tiePlanLines(db);
     } else report.warnings.push("Sheet 'Main Dashboard' not found: salary and plan not imported.");
   });
 

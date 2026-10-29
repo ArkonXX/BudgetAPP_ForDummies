@@ -58,3 +58,29 @@ export function moneyInput(cents: number, lang: Lang): string {
   const s = (cents / 100).toFixed(2);
   return lang === "pt" ? s.replace(".", ",") : s;
 }
+
+/** Parses a quantity or price such as "0,0125" or "1.234,5". Returns null when invalid or not positive. */
+export function parseDecimal(input: string): number | null {
+  let s = input.trim().replace(/[€\s]/g, "");
+  if (!s) return null;
+  if (s.includes(",") && s.includes(".")) {
+    s = s.lastIndexOf(",") > s.lastIndexOf(".") ? s.replace(/\./g, "").replace(",", ".") : s.replace(/,/g, "");
+  } else {
+    s = s.replace(",", ".");
+  }
+  if (!/^\d+(\.\d+)?$/.test(s)) return null;
+  const n = Number(s);
+  return n > 0 ? n : null;
+}
+
+/** A quantity or unit price with as many decimals as it needs (up to 8). */
+export function decimal(n: number, lang: Lang, maxDigits = 8): string {
+  return new Intl.NumberFormat(locale(lang), { maximumFractionDigits: maxDigits }).format(n);
+}
+
+/** A number for an editable field, "0,0125" style for Portuguese. */
+export function decimalInput(n: number | null, lang: Lang): string {
+  if (n == null) return "";
+  const s = String(Number(n.toFixed(8)));
+  return lang === "pt" ? s.replace(".", ",") : s;
+}

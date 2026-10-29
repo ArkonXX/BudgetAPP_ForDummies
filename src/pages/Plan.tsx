@@ -18,9 +18,12 @@ function ItemForm({ item, section, onClose, onSaved }: { item?: PlanItem; sectio
   const [amount, setAmount] = useState<number | null>(item?.amountCents ?? null);
   const [month, setMonth] = useState<number | null>(item?.month ?? (section === "annual" ? 1 : null));
   const [debitDay, setDebitDay] = useState<number | null>(item?.debitDay ?? null);
-  // Empty means "Subscrições" (created on the first debit) and the default account.
+  // Empty means "Subscrições" (created on the first debit) for subscriptions, its own line
+  // on the Budget for the rest, and the default account.
   const subsCategory = categories.find((c) => c.kind === "expense" && c.name.toLowerCase() === "subscrições");
-  const [categoryId, setCategoryId] = useState<number | null>(item?.categoryId ?? subsCategory?.id ?? null);
+  const [categoryId, setCategoryId] = useState<number | null>(
+    item ? (item.categoryId ?? (section === "subscription" ? (subsCategory?.id ?? null) : null)) : section === "subscription" ? (subsCategory?.id ?? null) : null,
+  );
   const [accountId, setAccountId] = useState<number | null>(item?.accountId ?? null);
   const [error, setError] = useState<string | null>(null);
   const expenseCategories = categories.filter((c) => c.kind === "expense" && (!c.archived || c.id === categoryId));
@@ -32,8 +35,8 @@ function ItemForm({ item, section, onClose, onSaved }: { item?: PlanItem; sectio
       setError(t("invalidAmount"));
       return;
     }
-    const debit = section === "subscription" ? { debitDay, categoryId } : {};
-    await api.post("/plan/items", { id: item?.id, section, name, amountCents: amount, month, sort: item?.sort ?? 99, accountId, ...debit });
+    const debit = section === "subscription" ? { debitDay } : {};
+    await api.post("/plan/items", { id: item?.id, section, name, amountCents: amount, month, sort: item?.sort ?? 99, accountId, categoryId, ...debit });
     onSaved();
     onClose();
   };
@@ -78,23 +81,20 @@ function ItemForm({ item, section, onClose, onSaved }: { item?: PlanItem; sectio
               </select>
               <small className="muted">{t("debitDayHint")}</small>
             </label>
-            {debitDay != null && (
-              <>
-                <label className="field">
-                  <span>{t("category")}</span>
-                  <select value={categoryId ?? ""} onChange={(e) => setCategoryId(e.target.value ? Number(e.target.value) : null)}>
-                    {!subsCategory && <option value="">{t("subscription")}</option>}
-                    {expenseCategories.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </>
-            )}
           </>
         )}
+        <label className="field">
+          <span>{t("planCategory")}</span>
+          <select value={categoryId ?? ""} onChange={(e) => setCategoryId(e.target.value ? Number(e.target.value) : null)}>
+            {section === "subscription" ? !subsCategory && <option value="">{t("subscription")}</option> : <option value="">{t("planOwnLine")}</option>}
+            {expenseCategories.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
+          <small className="muted">{t("planCategoryHelp")}</small>
+        </label>
         {accountOptions.length > 1 && (
           <label className="field">
             <span>{t("paidFrom")}</span>
@@ -131,7 +131,7 @@ function ItemForm({ item, section, onClose, onSaved }: { item?: PlanItem; sectio
 
 export default function Plan() {
   const { t, lang } = useI18n();
-  const { refresh, accounts } = useApp();
+  const { refresh, accounts, categories } = useApp();
   const accountName = (id: number | null) =>
     accounts.length > 1 ? (accounts.find((a) => (id == null ? a.isDefault : a.id === id))?.name ?? "") : "";
   const { data, error, reload } = useLoad(() => api.get<Data>("/plan"), []);
@@ -149,6 +149,14 @@ export default function Plan() {
   const defaultAccountId = accounts.find((a) => a.isDefault)?.id;
   const setLoanAccount = async (id: number, accountId: number) => {
     await api.put(`/plan/loans/${id}/account`, { accountId: accountId === defaultAccountId ? null : accountId });
+    reload();
+  };
+  const setLoanCategory = async (id: number, categoryId: number | null) => {
+    await api.put(`/plan/loans/${id}/category`, { categoryId });
+    reload();
+  };
+  const setLoanDebitDay = async (id: number, debitDay: number | null) => {
+    await api.put(`/plan/loans/${id}/debit-day`, { debitDay });
     reload();
   };
 
@@ -264,7 +272,7 @@ export default function Plan() {
         {itemList("annual")}
 
         <Section title={t("loans")} action={<Link to="/loans" className="link">{t("navLoans")} →</Link>}>
-          {accounts.length > 1 && (
+          {data.loans.some((l) => !l.paidOff) && (
             <ul className="list plan-loans">
               {data.loans
                 .filter((l) => !l.paidOff)
@@ -273,19 +281,52 @@ export default function Plan() {
                     <span className="list-main">
                       <span>{l.name}</span>
                       {/* The account the monthly payment leaves from, for the payday transfer. */}
+                      {accounts.length > 1 && (
+                        <select
+                          className="budget-account-select"
+                          aria-label={t("paidFrom")}
+                          value={l.accountId ?? defaultAccountId}
+                          onChange={(e) => setLoanAccount(l.id, Number(e.target.value))}
+                        >
+                          {accounts
+                            .filter((a) => !a.archived || a.id === l.accountId)
+                            .map((a) => (
+                              <option key={a.id} value={a.id}>
+                                {a.name}
+                              </option>
+                            ))}
+                        </select>
+                      )}
+                      {/* The category it counts in on the Budget and Year plan. */}
                       <select
                         className="budget-account-select"
-                        aria-label={t("paidFrom")}
-                        value={l.accountId ?? defaultAccountId}
-                        onChange={(e) => setLoanAccount(l.id, Number(e.target.value))}
+                        aria-label={t("planCategory")}
+                        value={l.categoryId ?? ""}
+                        onChange={(e) => setLoanCategory(l.id, e.target.value ? Number(e.target.value) : null)}
                       >
-                        {accounts
-                          .filter((a) => !a.archived || a.id === l.accountId)
-                          .map((a) => (
-                            <option key={a.id} value={a.id}>
-                              {a.name}
+                        <option value="">{t("planOwnLine")}</option>
+                        {categories
+                          .filter((c) => c.kind === "expense" && (!c.archived || c.id === l.categoryId))
+                          .map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.name}
                             </option>
                           ))}
+                      </select>
+                      {/* The day it is debited, then added to Entries as a paid expense. */}
+                      <select
+                        className="budget-account-select"
+                        aria-label={t("debitDay")}
+                        title={t("loanDebitDayHint")}
+                        value={l.debitDay ?? ""}
+                        onChange={(e) => setLoanDebitDay(l.id, e.target.value ? Number(e.target.value) : null)}
+                      >
+                        <option value="">{t("debitDayNone")}</option>
+                        {Array.from({ length: 31 }, (_, i) => (
+                          <option key={i + 1} value={i + 1}>
+                            {t("debitOnDay", { day: i + 1 })}
+                          </option>
+                        ))}
                       </select>
                     </span>
                     <Money cents={l.monthlyCents} />

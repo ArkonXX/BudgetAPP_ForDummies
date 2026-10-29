@@ -27,6 +27,7 @@ export type IconName =
   | "target"
   | "card"
   | "bars"
+  | "trend"
   | "swap"
   | "calendar"
   | "grid"
@@ -77,6 +78,12 @@ export function Icon({ name, size }: { name: IconName; size?: number }) {
       return (
         <Svg size={size}>
           <path d="M5 20V11M12 20V5M19 20v-6" />
+        </Svg>
+      );
+    case "trend":
+      return (
+        <Svg size={size}>
+          <path d="M4 17l5-5 4 3 7-8M15 7h5v5" />
         </Svg>
       );
     case "swap":

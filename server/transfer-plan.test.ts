@@ -65,7 +65,7 @@ test("confirming records one transfer for the month and account", () => {
   const { db, revolut, montepio, item } = setup();
   store.updateSettings(db, { salaryAccountId: montepio });
   item("fixed", "Seguro casa", 3500, revolut);
-  store.saveTransfer(db, { date: "2026-10-30", amountCents: 3500, fromAccountId: montepio, toAccountId: revolut, note: "", budgetMonth: "2026-11" });
+  store.saveTransfer(db, { date: "2026-10-30", amountCents: 3500, fromAccountId: montepio, toAccountId: revolut, note: "", budgetMonth: "2026-11" }, "2026-10-30");
   const [rev] = transferPlan(db, "2026-11").needs;
   assert.equal(rev.transfer?.amountCents, 3500);
   assert.equal(store.listAccounts(db).find((a) => a.id === revolut)!.balanceCents, 3500);

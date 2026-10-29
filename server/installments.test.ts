@@ -137,12 +137,12 @@ test("the budget table shows what is still to pay, and money paid back to people
   const gym = store.ensureCategory(db, "expense", "Subscrições");
   klarna(db, ferias);
   store.saveTransaction(db, { kind: "expense", date: "2026-10-15", amountCents: 2100, description: "Ginásio", categoryId: gym, paid: false });
-  store.saveTransaction(db, { kind: "expense", date: "2026-11-03", amountCents: 500, description: "Ginásio", categoryId: gym });
+  store.saveTransaction(db, { kind: "expense", date: "2026-11-03", amountCents: 500, description: "Ginásio", categoryId: gym }, "2026-11-03");
   store.savePersonalLoan(db, { person: "Ana", direction: "borrowed", date: "2026-10-10", amountCents: 20000, dueDate: null, note: "" });
   store.savePersonalLoan(db, { person: "Ana", direction: "lent", date: "2026-10-12", amountCents: 5000, dueDate: null, note: "" });
   store.savePersonalLoan(db, { person: "Rui", direction: "borrowed", date: "2026-11-20", amountCents: 3000, dueDate: null, note: "" });
   store.savePersonalLoan(db, { person: "Zé", direction: "lent", date: "2026-10-01", amountCents: 9000, dueDate: null, note: "" });
-  store.payPerson(db, { person: "Ana", direction: "borrowed", date: "2026-11-02", amountCents: 8000, note: "" });
+  store.payPerson(db, { person: "Ana", direction: "borrowed", date: "2026-11-02", amountCents: 8000, note: "" }, "2026-11-05");
   store.payPerson(db, { person: "Zé", direction: "lent", date: "2026-11-02", amountCents: 1000, note: "" });
 
   const nov = monthSummary(db, "2026-11", "2026-11-05");

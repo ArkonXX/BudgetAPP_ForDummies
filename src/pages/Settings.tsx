@@ -6,6 +6,7 @@ import { dateLabel, money } from "../format";
 import { monthOf, periodRange, todayISO } from "../../shared/period";
 import { EXPENSE_GROUPS, Modal, MoneyField, Section, SpentFromSelect } from "../components";
 import BabyStepsSettings from "../BabyStepsSettings";
+import BackupSettings from "../BackupSettings";
 import type { Category, ExpenseGroup, Kind } from "../../shared/types";
 
 /** The day before an exclusive end date. */
@@ -289,12 +290,7 @@ export default function SettingsPage() {
           )}
         </Section>
 
-        <Section title={t("backupTitle")}>
-          <p className="muted small">{t("backupHelp")}</p>
-          <a className="btn" href="/api/backup" download>
-            {t("downloadBackup")}
-          </a>
-        </Section>
+        <BackupSettings />
 
         <Section title={t("wipeTitle")}>
           <p className="muted small">{t("wipeHelp")}</p>

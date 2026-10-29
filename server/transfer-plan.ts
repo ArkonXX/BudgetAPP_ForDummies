@@ -55,7 +55,7 @@ export function transferPlan(db: DB, month: Month): TransferPlan {
     part(i.accountId ?? defaultId, { name: i.name, cents: i.amountCents, kind: i.section });
   }
   // Day-to-day categories: what is planned for them that month. Those tied to a Plan line are already counted.
-  const tied = new Set(listPlanItems(db).map((i) => i.categoryId));
+  const tied = new Set([...listPlanItems(db), ...listLoans(db)].map((i) => i.categoryId));
   const plans = monthPlans(db, month);
   for (const c of listCategories(db))
     if (c.kind === "expense" && c.group === "variable" && c.accountId != null && !c.archived && !tied.has(c.id))

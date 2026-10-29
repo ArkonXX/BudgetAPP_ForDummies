@@ -1,8 +1,8 @@
 import type { DB } from "./db.ts";
-import { getSettings, listInstallmentPlans, listPersonalLoans, listPlanItems, listPots, personKey } from "./store.ts";
+import { getSettings, listAccounts, listInstallmentPlans, listPersonalLoans, listPlanItems, listPots, personKey } from "./store.ts";
 import { monthSummary, repaidToPeople } from "./reports.ts";
 import { addMonths, monthStartOf, parseMonth, periodRange, type Month } from "../shared/period.ts";
-import type { Debts, Overview, Tip } from "../shared/types.ts";
+import type { Account, Available, Debts, MonthSummary, NetWorth, Overview, Tip, Todo } from "../shared/types.ts";
 
 const DAY = 86400_000;
 const dayIndex = (from: string, date: string) =>
@@ -10,6 +10,10 @@ const dayIndex = (from: string, date: string) =>
 
 // How many earlier months make up the "usual" spending.
 const USUAL_MONTHS = 6;
+// Debits this close are listed as coming soon.
+const SOON_DAYS = 7;
+
+const addDays = (date: string, n: number) => new Date(Date.parse(`${date}T00:00:00Z`) + n * DAY).toISOString().slice(0, 10);
 
 type Spend = { categoryId: number | null; day: number; cents: number };
 
@@ -41,7 +45,7 @@ function totals(db: DB, from: string, to: string) {
       `SELECT
          COALESCE((SELECT SUM(amount_cents) FROM transactions WHERE kind = 'income' AND paid = 1 AND date >= ?1 AND date < ?2), 0) AS income,
          COALESCE((SELECT SUM(amount_cents) FROM transactions WHERE kind = 'expense' AND paid = 1 AND date >= ?1 AND date < ?2), 0) AS expense,
-         COALESCE((SELECT SUM(amount_cents) FROM savings_movements WHERE amount_cents > 0 AND opening = 0 AND date >= ?1 AND date < ?2), 0) AS savings`,
+         COALESCE((SELECT SUM(amount_cents) FROM savings_movements WHERE amount_cents > 0 AND opening = 0 AND scheduled = 0 AND date >= ?1 AND date < ?2), 0) AS savings`,
     )
     .get(from, to) as { income: number; expense: number; savings: number };
   return { incomeCents: Number(row.income), expenseCents: Number(row.expense), savingsCents: Number(row.savings) };
@@ -67,6 +71,97 @@ export function debts(db: DB): Debts {
     iOweCents,
     installmentsLeftCents: listInstallmentPlans(db).reduce((a, p) => a + p.remainingCents, 0),
   };
+}
+
+/**
+ * What is free to spend until the end of the month in progress: the money in
+ * the accounts less what still has to leave them. That is unpaid expenses and
+ * debits still to come, fixed costs and loans planned but not paid yet, and
+ * savings planned but not deposited yet.
+ */
+export function available(summary: MonthSummary, accounts: Account[], daysLeft: number): Available {
+  const accountsCents = accounts.reduce((a, x) => a + x.balanceCents, 0);
+  const toPayCents = summary.pendingCents + summary.upcomingCents;
+  let fixedLeftCents = 0;
+  let dayToDayLeftCents = 0;
+  // A Plan line with no category is paid into some other category, so what
+  // fixed and credit categories spent beyond their own plan pays for it.
+  let untiedCents = 0;
+  let beyondPlanCents = 0;
+  for (const l of summary.expenses) {
+    const left = l.plannedCents - l.actualCents - l.toPayCents;
+    if (l.planKey) untiedCents += l.plannedCents;
+    else if (l.group === "variable") dayToDayLeftCents += Math.max(0, left);
+    else if (left > 0) fixedLeftCents += left;
+    else beyondPlanCents -= left;
+  }
+  fixedLeftCents += Math.max(0, untiedCents - beyondPlanCents);
+  const savingsLeftCents = Math.max(0, summary.plannedSavingsCents - summary.savingsCents);
+  return {
+    accountsCents,
+    toPayCents,
+    fixedLeftCents,
+    savingsLeftCents,
+    freeCents: accountsCents - toPayCents - fixedLeftCents - savingsLeftCents,
+    daysLeft,
+    dayToDayLeftCents,
+  };
+}
+
+export function netWorth(accounts: Account[], pots: { balanceCents: number }[], d: Debts): NetWorth {
+  const accountsCents = accounts.reduce((a, x) => a + x.balanceCents, 0);
+  const potsCents = pots.reduce((a, p) => a + p.balanceCents, 0);
+  return {
+    accountsCents,
+    potsCents,
+    owedToMeCents: d.owedToMeCents,
+    iOweCents: d.iOweCents,
+    installmentsLeftCents: d.installmentsLeftCents,
+    totalCents: accountsCents + potsCents + d.owedToMeCents - d.iOweCents - d.installmentsLeftCents,
+  };
+}
+
+/** Things to do for the month shown, most urgent first. */
+function todoList(db: DB, summary: MonthSummary, accounts: Account[], today: string, inProgress: boolean): Todo[] {
+  const out: Todo[] = [];
+  const item = (t: Partial<Todo> & Pick<Todo, "type" | "level">): Todo => ({ name: "", count: 0, amountCents: 0, compareCents: 0, ...t });
+  if (summary.previousOpen) out.push(item({ type: "closeMonth", level: "warn", name: summary.previousOpen }));
+  if (summary.canClose) out.push(item({ type: "closeMonth", level: "warn", name: summary.month }));
+
+  const loose = db
+    .prepare(
+      `SELECT COUNT(*) AS n, COALESCE(SUM(amount_cents), 0) AS total FROM transactions
+       WHERE category_id IS NULL AND paid = 1 AND date >= ? AND date < ?`,
+    )
+    .get(summary.from, summary.to) as { n: number; total: number };
+  if (Number(loose.n) > 0)
+    out.push(item({ type: "uncategorised", level: "warn", count: Number(loose.n), amountCents: Number(loose.total) }));
+
+  if (!inProgress) return out;
+
+  if (summary.pending.length)
+    out.push(
+      item({
+        type: "pending",
+        level: summary.pending.some((t) => t.date < today) ? "bad" : "warn",
+        count: summary.pending.length,
+        amountCents: summary.pendingCents,
+      }),
+    );
+
+  // An account that holds less than what still leaves it this month.
+  for (const a of accounts) {
+    const owing = [...summary.pending, ...summary.upcoming].filter((x) => x.accountId === a.id).reduce((s, x) => s + x.amountCents, 0);
+    if (owing > 0 && a.balanceCents < owing)
+      out.push(item({ type: "shortAccount", level: "bad", name: a.name, amountCents: owing - a.balanceCents, compareCents: owing }));
+  }
+
+  const soon = summary.upcoming.filter((d) => d.date <= addDays(today, SOON_DAYS)).sort((a, b) => a.date.localeCompare(b.date));
+  if (soon.length)
+    out.push(
+      item({ type: "debitsSoon", level: "info", name: soon[0].name, count: soon.length, amountCents: soon.reduce((s, d) => s + d.amountCents, 0) }),
+    );
+  return out;
 }
 
 /** Everything the overview screen shows for one budget month, with suggestions. */
@@ -159,6 +254,17 @@ export function overview(db: DB, month: Month, today: string): Overview {
     (a, b) => order[a.level] - order[b.level] || Math.abs(b.amountCents - b.compareCents) - Math.abs(a.amountCents - a.compareCents),
   );
 
+  const accounts = listAccounts(db);
+  const pots = listPots(db);
+  const owing = debts(db);
+  // Unlike inProgress, this includes the month's last day.
+  const isCurrent = today >= from && today < to;
+  const todo = todoList(db, summary, accounts, today, isCurrent);
+  // Suggestions that aren't about one category are things to do.
+  for (const tip of tips)
+    if (tip.type === "savingsBehind" || tip.type === "annualNext")
+      todo.push({ type: tip.type, level: tip.level === "info" ? "info" : "warn", name: tip.name, count: 0, amountCents: tip.amountCents, compareCents: tip.compareCents });
+
   return {
     summary,
     days,
@@ -167,8 +273,11 @@ export function overview(db: DB, month: Month, today: string): Overview {
     previousCumulativeCents,
     projectedExpenseCents,
     history,
-    pots: listPots(db),
-    tips: tips.slice(0, 6),
-    debts: debts(db),
+    pots,
+    tips: tips.filter((t) => t.type !== "savingsBehind" && t.type !== "annualNext"),
+    debts: owing,
+    available: isCurrent ? available(summary, accounts, days - elapsedDays + 1) : null,
+    todo,
+    netWorth: netWorth(accounts, pots, owing),
   };
 }

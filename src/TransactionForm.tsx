@@ -5,7 +5,8 @@ import { useI18n } from "./i18n";
 import { dateLabel, money } from "./format";
 import { Modal, MoneyField, useLoad } from "./components";
 import { installmentDate, todayISO } from "../shared/period";
-import type { Kind, PersonalLoan, Transaction } from "../shared/types";
+import { descriptionKey } from "../shared/describe";
+import type { CategoryHint, Kind, PersonalLoan, Transaction } from "../shared/types";
 
 // Spacing between installments: same day each month, or every N days.
 const INTERVALS: { days: number | null; key: "everyMonth" | "every30Days" | "every14Days" }[] = [
@@ -75,7 +76,7 @@ export default function TransactionForm({
   const [accountId, setAccountId] = useState<number | null>(
     initial?.accountId ?? accounts.find((a) => a.isDefault)?.id ?? null,
   );
-  const [unpaid, setUnpaid] = useState(initial ? !initial.paid : false);
+  const [unpaid, setUnpaid] = useState(initial ? !initial.paid && !initial.scheduled : false);
   // Only a new expense can be split; each installment is then edited on its own.
   const [split, setSplit] = useState(!initial && startInInstallments);
   const [count, setCount] = useState(3);
@@ -88,7 +89,28 @@ export default function TransactionForm({
   // recorded in Loans against that account rather than as an expense or income.
   const people = [...loanPeople(useLoad(() => api.get<{ personal: PersonalLoan[] }>("/loans").then((r) => r.personal), []).data ?? []).values()];
   const [loan, setLoan] = useState("");
+  // Dated after today (or still waiting on the same date): it only counts once confirmed on its day.
+  const waiting =
+    !split && !initial?.installment && (date > todayISO() || (initial?.scheduled === true && date === initial.date));
   const options = categories.filter((c) => c.kind === kind && (!c.archived || c.id === categoryId));
+
+  // A new entry whose description was used before gets that entry's category, until
+  // a category is picked by hand. `hint` is the earlier description it came from.
+  const hints = useLoad(() => api.get<CategoryHint[]>("/transactions/category-hints"), []).data ?? [];
+  const [picked, setPicked] = useState(!!initial);
+  const [hint, setHint] = useState<string | null>(null);
+  const suggest = (text: string, k: Kind) => {
+    if (picked || loan) return;
+    const key = descriptionKey(text);
+    const h = key ? hints.find((x) => x.kind === k && descriptionKey(x.description) === key) : undefined;
+    if (h && categories.some((c) => c.id === h.categoryId && c.kind === k)) {
+      setCategoryId(h.categoryId);
+      setHint(h.description);
+    } else if (hint != null) {
+      setCategoryId(null);
+      setHint(null);
+    }
+  };
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -191,18 +213,44 @@ export default function TransactionForm({
       <form onSubmit={submit} className="form">
         <div className="segmented">
           {(["expense", "income"] as Kind[]).map((k) => (
-            <button type="button" key={k} className={kind === k ? "active" : ""} onClick={() => setKind(k)}>
+            <button type="button" key={k} className={kind === k ? "active" : ""} onClick={() => {
+                setKind(k);
+                suggest(description, k);
+              }}>
               {t(k)}
             </button>
           ))}
         </div>
         <MoneyField label={split && kind === "expense" ? t("totalAmount") : t("amount")} cents={amount} onChange={setAmount} autoFocus={!initial} />
         <label className="field">
+          <span>{t("description")}</span>
+          <input
+            value={description}
+            maxLength={200}
+            list={initial ? undefined : "entry-descriptions"}
+            onChange={(e) => {
+              setDescription(e.target.value);
+              suggest(e.target.value, kind);
+            }}
+          />
+        </label>
+        {!initial && (
+          <datalist id="entry-descriptions">
+            {hints
+              .filter((h) => h.kind === kind)
+              .map((h) => (
+                <option key={h.description} value={h.description} />
+              ))}
+          </datalist>
+        )}
+        <label className="field">
           <span>{t("category")}</span>
           <select
             value={loan || (categoryId ?? "")}
             onChange={(e) => {
               const v = e.target.value;
+              setPicked(true);
+              setHint(null);
               setLoan(v.startsWith("l:") ? v : "");
               setCategoryId(v && !v.startsWith("l:") ? Number(v) : null);
               if (v.startsWith("l:")) setSplit(false);
@@ -232,6 +280,7 @@ export default function TransactionForm({
             )}
           </select>
         </label>
+        {hint != null && !loan && <p className="muted small">{t("categorySuggested", { description: hint })}</p>}
         {loan && (
           <p className="muted small">
             {t(loan.startsWith("l:repay:") ? "entryRepayHelp" : "entryLoanHelp", {
@@ -303,7 +352,8 @@ export default function TransactionForm({
             <p className="muted small">{t("installmentsHelp")}</p>
           </fieldset>
         )}
-        {kind === "expense" && !split && !loan && (
+        {waiting && <p className="muted small">{t("scheduledHelp", { date: dateLabel(date, lang) })}</p>}
+        {kind === "expense" && !split && !loan && !waiting && (
           <>
             <label className="check">
               <input
@@ -320,10 +370,6 @@ export default function TransactionForm({
             {unpaid && <p className="muted small">{t("unpaidHelp")}</p>}
           </>
         )}
-        <label className="field">
-          <span>{t("description")}</span>
-          <input value={description} maxLength={200} onChange={(e) => setDescription(e.target.value)} />
-        </label>
         {error && <p className="error">{error}</p>}
         <div className="form-actions">
           {initial && (!initial.installment || installmentPaid) && (

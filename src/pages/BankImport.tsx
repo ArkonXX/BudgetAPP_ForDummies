@@ -72,13 +72,13 @@ export default function BankImport() {
       setLines(
         p.rows.map((r) => {
           // A category used before for the same description wins over a name in it.
-          const suggested = !r.categoryId && r.loanPerson != null;
+          const loan = !r.categoryId && r.loanPerson != null;
           return {
             ...r,
             use: !r.duplicate && !r.skip && !r.closed,
-            as: r.categoryId ? `c:${r.categoryId}` : suggested ? suggestLoan(r, people) : "",
+            as: r.categoryId ? `c:${r.categoryId}` : loan ? suggestLoan(r, people) : "",
+            suggested: r.categoryId != null || loan,
             person: "",
-            suggested,
           };
         }),
       );

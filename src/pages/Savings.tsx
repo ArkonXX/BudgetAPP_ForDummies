@@ -3,7 +3,7 @@ import { api } from "../api";
 import { useApp } from "../App";
 import { useI18n } from "../i18n";
 import { dateLabel, money } from "../format";
-import { Loading, Modal, Money, MoneyField, Progress, Section, useLoad } from "../components";
+import { Loading, Modal, Money, MoneyField, Progress, ScheduledHint, ScheduledTag, Section, useLoad } from "../components";
 import { todayISO } from "../../shared/period";
 import type { SavingsMovement, SavingsPot } from "../../shared/types";
 
@@ -144,6 +144,7 @@ function MovementForm({
           <span>{t("date")}</span>
           <input type="date" required value={date} onChange={(e) => setDate(e.target.value)} />
         </label>
+        <ScheduledHint date={date} />
         <label className="field">
           <span>{t("place")}</span>
           <input maxLength={80} value={place} onChange={(e) => setPlace(e.target.value)} />
@@ -237,6 +238,7 @@ export default function Savings() {
                       {m.opening ? ` · ${t("openingBalance")}` : ""}
                       {m.accountId ? ` · ${accountName.get(m.accountId) ?? ""}` : m.place ? ` · ${m.place}` : ""}
                       {m.note && !m.opening ? ` · ${m.note}` : ""}
+                      {m.scheduled && <ScheduledTag date={m.date} />}
                     </span>
                   </div>
                   <Money cents={m.amountCents} signed />

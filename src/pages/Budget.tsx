@@ -1,13 +1,13 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { useApp } from "../App";
 import { useI18n, type Lang } from "../i18n";
 import { dateLabel, monthLabel } from "../format";
-import { addMonths, todayISO } from "../../shared/period";
+import { todayISO } from "../../shared/period";
 import CloseMonth, { monthName } from "../CloseMonth";
-import { EXPENSE_GROUPS, Loading, Money, MonthNav, PlannedInput, Section, SpentFromSelect, useLoad } from "../components";
-import type { MonthClose, MonthSummary, SummaryLine } from "../../shared/types";
+import { EXPENSE_GROUPS, Loading, Modal, Money, MonthNav, PlannedInput, Section, SpentFromSelect, useLoad } from "../components";
+import type { Kind, MonthClose, MonthSummary, SummaryLine, Transaction } from "../../shared/types";
 
 type Row = { key: string; name: string; plannedCents: number; actualCents: number; line?: SummaryLine };
 
@@ -17,11 +17,94 @@ function Amount({ cents, signed }: { cents: number; signed?: boolean }) {
 }
 
 /**
+ * The month's paid entries without a category, which make up the budget's
+ * "Uncategorised" row, each with a quick way to give it one.
+ */
+function UncategorisedEntries({ month, kind, onClose, onSaved }: { month: string; kind: Kind; onClose: () => void; onSaved: () => void }) {
+  const { t, lang } = useI18n();
+  const { accounts, categories } = useApp();
+  const { data, error, reload } = useLoad(() => api.get<Transaction[]>(`/transactions?month=${month}&kind=${kind}`), [month, kind]);
+  const [busy, setBusy] = useState<number | null>(null);
+  const entries = (data ?? []).filter((e) => e.categoryId == null && e.paid);
+  const options = categories.filter((c) => c.kind === kind && !c.archived);
+  const groupOf = (g: string) => EXPENSE_GROUPS.find((x) => x.group === g);
+  const accountName = (id: number) => (accounts.length > 1 ? accounts.find((a) => a.id === id)?.name : "");
+  const assign = async (e: Transaction, categoryId: number) => {
+    setBusy(e.id);
+    try {
+      await api.post("/transactions", { ...e, categoryId });
+      reload();
+      onSaved();
+    } finally {
+      setBusy(null);
+    }
+  };
+  return (
+    <Modal title={t("uncategorisedTitle", { month: monthLabel(month, lang) })} onClose={onClose}>
+      {!data ? (
+        <Loading error={error} />
+      ) : entries.length === 0 ? (
+        <p className="muted">{t("uncategorisedDone")}</p>
+      ) : (
+        <>
+          <p className="muted small">{t("uncategorisedHelp")}</p>
+          <ul className="list uncategorised-list">
+            {entries.map((e) => (
+              <li key={e.id} className="uncategorised-entry">
+                <div className="budget-row">
+                  <span className="list-main">
+                    <strong>{e.description || t("noCategory")}</strong>
+                    <span className="muted small">
+                      {dateLabel(e.date, lang)}
+                      {accountName(e.accountId) ? ` · ${accountName(e.accountId)}` : ""}
+                    </span>
+                  </span>
+                  <Money cents={kind === "expense" ? -e.amountCents : e.amountCents} signed />
+                </div>
+                <select
+                  aria-label={t("category")}
+                  value=""
+                  disabled={busy === e.id}
+                  onChange={(ev) => ev.target.value && assign(e, Number(ev.target.value))}
+                >
+                  <option value="">{t("pickCategory")}</option>
+                  {kind === "expense"
+                    ? EXPENSE_GROUPS.map(({ group, label }) => {
+                        const inGroup = options.filter((c) => c.group === group);
+                        return inGroup.length ? (
+                          <optgroup key={group} label={t(groupOf(group)!.label)}>
+                            {inGroup.map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.name}
+                              </option>
+                            ))}
+                          </optgroup>
+                        ) : null;
+                      })
+                    : options.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.name}
+                        </option>
+                      ))}
+                </select>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </Modal>
+  );
+}
+
+/**
  * One table of the month's budget, like the spreadsheet's Sumário: what is
  * planned, what is spent (or received) and what is left, per category. The
  * Budget shows one per group of expenses, one for income and one for
  * savings. Unpaid expenses and money paid back to people are shown elsewhere.
  */
+/** The "Uncategorised" line: entries with no category, not a Plan line. */
+const isLoose = (l: SummaryLine) => l.categoryId == null && !l.planKey && l.actualCents !== 0;
+
 function BudgetTable({
   month,
   lines,
@@ -29,6 +112,7 @@ function BudgetTable({
   editing,
   income,
   pickAccount,
+  openUncategorised,
   onSaved,
 }: {
   month: string;
@@ -37,10 +121,12 @@ function BudgetTable({
   editing: boolean;
   income?: boolean;
   pickAccount?: boolean; // day-to-day spending: choose the account each category is spent from
+  openUncategorised?: boolean; // open the uncategorised entries straight away (linked from the overview)
   onSaved: () => void;
 }) {
   const { t } = useI18n();
   const { accounts, categories, refresh } = useApp();
+  const [showUncategorised, setShowUncategorised] = useState(() => !!openUncategorised && lines.some(isLoose));
   const setAccount = async (categoryId: number, accountId: number | null) => {
     const c = categories.find((x) => x.id === categoryId);
     if (!c) return;
@@ -52,7 +138,7 @@ function BudgetTable({
   const accountNames = (l?: SummaryLine) =>
     accounts.length > 1 && l ? l.accountIds.map((id) => accounts.find((a) => a.id === id)?.name).filter(Boolean).join(", ") : "";
   const toRow = (l: SummaryLine): Row => ({
-    key: String(l.categoryId ?? "none"),
+    key: l.planKey ?? String(l.categoryId ?? "none"),
     name: l.name || t("uncategorised"),
     plannedCents: l.plannedCents,
     actualCents: l.actualCents,
@@ -60,7 +146,8 @@ function BudgetTable({
   });
   const used = (r: Row) => r.plannedCents || r.actualCents;
   // Hide empty rows unless editing, like the spreadsheet's unused categories.
-  const rows = (editing ? lines.filter((l) => l.categoryId != null) : lines).map(toRow).filter((r) => editing || used(r));
+  // Plan lines without a category stay, but are changed on the Plan.
+  const rows = (editing ? lines.filter((l) => l.categoryId != null || l.planKey) : lines).map(toRow).filter((r) => editing || used(r));
   const all = [...rows, ...(savings ? [savings] : [])];
   // Expenses: what is left to spend. Income: what is still to come in.
   const leftOf = (r: { plannedCents: number; actualCents: number }) =>
@@ -73,7 +160,20 @@ function BudgetTable({
   const row = (r: Row, editable: boolean) => (
     <tr key={r.key}>
       <td className="sticky">
-        <span className="budget-name">{r.name}</span>
+        {/* What makes up "Uncategorised" is shown on a tap, to give each entry a category. */}
+        {r.line && r.line.categoryId == null && !r.line.planKey && r.actualCents ? (
+          <button className="budget-name link-btn" onClick={() => setShowUncategorised(true)}>
+            {r.name} <span className="muted small">· {t("seeEntries")}</span>
+          </button>
+        ) : (
+          <span className="budget-name">{r.name}</span>
+        )}
+        {/* The Plan lines that make up what is planned, or that this is one. */}
+        {r.line?.planKey ? (
+          <span className="budget-account muted">{t("fromPlan")}</span>
+        ) : (
+          r.line?.fromPlan.length ? <span className="budget-account muted">{r.line.fromPlan.join(", ")}</span> : null
+        )}
         {editing && pickAccount && r.line?.categoryId != null ? (
           <SpentFromSelect
             value={categories.find((c) => c.id === r.line!.categoryId)?.accountId ?? null}
@@ -131,6 +231,9 @@ function BudgetTable({
           </tfoot>
         </table>
       </div>
+      {showUncategorised && (
+        <UncategorisedEntries month={month} kind={income ? "income" : "expense"} onClose={() => setShowUncategorised(false)} onSaved={onSaved} />
+      )}
     </>
   );
 }
@@ -142,19 +245,19 @@ const sum = (lines: SummaryLine[], key: "plannedCents" | "actualCents") => lines
  * each table above, planned and actual, down to what is left over.
  */
 function MonthSums({ data, groups }: { data: MonthSummary; groups: { label: string; lines: SummaryLine[] }[] }) {
-  const { t, lang } = useI18n();
-  const rows: { key: string; label: string; planned: number | null; actual: number; minus?: boolean }[] = [
+  const { t } = useI18n();
+  const rows: { key: string; label: string; planned: number; actual: number; minus?: boolean }[] = [
     { key: "income", label: t("incomes"), planned: data.plannedIncomeCents, actual: data.totalIncomeCents },
-    ...(data.carriedInCents
-      ? [{ key: "carried", label: t("carriedInFrom", { month: monthName(addMonths(data.month, -1), lang) }), planned: data.carriedInCents, actual: data.carriedInCents }]
-      : []),
     ...groups.map((g) => ({ key: g.label, label: g.label, planned: sum(g.lines, "plannedCents"), actual: sum(g.lines, "actualCents"), minus: true })),
     { key: "savings", label: t("savingsGroup"), planned: data.plannedSavingsCents, actual: data.savingsCents, minus: true },
-    ...(data.repaidCents ? [{ key: "repaid", label: t("repaidTitle"), planned: null, actual: data.repaidCents, minus: true }] : []),
+    // Planned: what is paid back this month plus what is still owed by a due date in it.
+    ...(data.repaidCents + data.repaidDueCents
+      ? [{ key: "repaid", label: t("repaidTitle"), planned: data.repaidCents + data.repaidDueCents, actual: data.repaidCents, minus: true }]
+      : []),
   ];
-  const left = (k: "planned" | "actual") => rows.reduce((a, r) => a + (r[k] ?? 0) * (r.minus ? -1 : 1), 0);
-  const cell = (cents: number | null, minus?: boolean) =>
-    cents == null ? <span className="muted">–</span> : <Money cents={minus && cents ? -cents : cents} signed={minus && cents !== 0} />;
+  const left = (k: "planned" | "actual") => rows.reduce((a, r) => a + r[k] * (r.minus ? -1 : 1), 0);
+  const stillToPay = data.pendingCents + data.upcomingCents + data.repaidDueCents;
+  const cell = (cents: number, minus?: boolean) => <Money cents={minus && cents ? -cents : cents} signed={minus && cents !== 0} />;
   return (
     <Section title={t("monthSums")}>
       <div className="table-wrap">
@@ -187,12 +290,12 @@ function MonthSums({ data, groups }: { data: MonthSummary; groups: { label: stri
                 <Money cents={data.balanceCents} />
               </td>
             </tr>
-            {data.pendingCents + data.upcomingCents > 0 && (
+            {stillToPay > 0 && (
               <tr className="after-row">
                 <td className="sticky">{t("leftOverAfterPending")}</td>
                 <td />
-                <td className={`num ${data.balanceCents - data.pendingCents - data.upcomingCents < 0 ? "neg" : ""}`}>
-                  <Money cents={data.balanceCents - data.pendingCents - data.upcomingCents} />
+                <td className={`num ${data.balanceCents - stillToPay < 0 ? "neg" : ""}`}>
+                  <Money cents={data.balanceCents - stillToPay} />
                 </td>
               </tr>
             )}
@@ -226,6 +329,7 @@ function Pending({ data, onPaid }: { data: MonthSummary; onPaid: () => void }) {
               <span className="budget-name">
                 {p.description || categories.find((c) => c.id === p.categoryId)?.name || t("noCategory")}
                 {p.installment && <span className="muted"> ({p.installment.seq}/{p.installment.count})</span>}
+                {p.scheduled && <span className="muted small"> · {t("scheduledTag")} {dateLabel(p.date, lang)}</span>}
                 {p.dueMonth < data.month && (
                   <span className="muted small"> · {t("carriedFrom", { month: lang === "pt" ? monthLabel(p.dueMonth, lang).toLowerCase() : monthLabel(p.dueMonth, lang) })}</span>
                 )}
@@ -250,7 +354,7 @@ function Upcoming({ data }: { data: MonthSummary }) {
     <Section title={t("upcomingTitle")} action={<span className="small muted"><Money cents={data.upcomingCents} /></span>}>
       <ul className="budget-lines">
         {data.upcoming.map((d) => (
-          <li key={`${d.itemId}-${d.date}`}>
+          <li key={`${d.source}-${d.itemId}-${d.date}`}>
             <div className="budget-row">
               <span className="budget-name">
                 {d.name}
@@ -267,37 +371,76 @@ function Upcoming({ data }: { data: MonthSummary }) {
   );
 }
 
-/** Money paid back to people this month: it counts here, not when it was borrowed. */
+/**
+ * Money paid back to people this month: it counts here, not when it was
+ * borrowed. Planned adds what is still to pay this month: repayments dated
+ * ahead and what is owed by a due date in it.
+ */
 function Repaid({ data }: { data: MonthSummary }) {
   const { t } = useI18n();
+  const people = new Map<string, { person: string; paid: number; due: number }>();
+  const add = (person: string, k: "paid" | "due", cents: number) => {
+    const key = person.trim().toLocaleLowerCase("pt-PT");
+    const p = people.get(key) ?? { person, paid: 0, due: 0 };
+    p[k] += cents;
+    people.set(key, p);
+  };
+  for (const r of data.repaid) add(r.person, "paid", r.cents);
+  for (const r of data.repaidDue) add(r.person, "due", r.cents);
+  const all = [...people.values()];
+  const total = { paid: data.repaidCents, due: data.repaidDueCents };
+  const cells = (r: { paid: number; due: number }) => (
+    <>
+      <td className="num">
+        <Money cents={r.paid + r.due} />
+      </td>
+      <td className="num">
+        <Money cents={r.paid} />
+      </td>
+      <td className="num left-col">
+        <Money cents={r.due} />
+      </td>
+    </>
+  );
   return (
-    <Section title={t("repaidTitle")} action={<span className="small"><Money cents={-data.repaidCents} signed /></span>}>
-      <ul className="budget-lines">
-        {data.repaid.map((r) => (
-          <li key={r.person}>
-            <div className="budget-row">
-              <span className="budget-name">
-                <Link to="/loans">{r.person}</Link>
-              </span>
-              <span className="budget-nums">
-                <Money cents={r.cents} />
-              </span>
-            </div>
-          </li>
-        ))}
-      </ul>
+    <Section title={t("repaidTitle")}>
+      <div className="table-wrap">
+        <table className="budget-table">
+          <thead>
+            <tr>
+              <th className="sticky">{t("person")}</th>
+              <th className="num">{t("planned")}</th>
+              <th className="num">{t("paidBack")}</th>
+              <th className="num">{t("toPay")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {all.map((r) => (
+              <tr key={r.person}>
+                <td className="sticky">
+                  <Link to="/loans" className="budget-name">{r.person}</Link>
+                </td>
+                {cells(r)}
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td className="sticky">{t("total")}</td>
+              {cells(total)}
+            </tr>
+          </tfoot>
+        </table>
+      </div>
       <p className="muted small">{t("repaidHelp")}</p>
     </Section>
   );
 }
 
-/** A closed month: where its leftover went and the balances that were set, with a way to reopen it. */
+/** A closed month: when it was closed, how it ended and the balances checked then, with a way to reopen it. */
 function Closed({ data, close, onReopened }: { data: MonthSummary; close: MonthClose; onReopened: () => void }) {
   const { t, lang } = useI18n();
   const { accounts } = useApp();
-  const { data: savings } = useLoad(() => api.get<{ pots: { id: number; name: string }[] }>("/savings"), []);
-  const next = monthName(addMonths(data.month, 1), lang);
-  const pot = savings?.pots.find((p) => p.id === close.potId)?.name ?? "";
   const reopen = async () => {
     if (!confirm(t("reopenConfirm", { month: monthName(data.month, lang) }))) return;
     await api.del(`/month-close/${data.month}`);
@@ -307,26 +450,14 @@ function Closed({ data, close, onReopened }: { data: MonthSummary; close: MonthC
     <section className="card closed-card">
       <div className="card-head">
         <h2>{t("monthClosed")}</h2>
-        {data.canReopen && (
-          <button className="btn small-btn" onClick={reopen}>
-            {t("reopen")}
-          </button>
-        )}
+        <button className="btn small-btn" onClick={reopen}>
+          {t("reopen")}
+        </button>
       </div>
       <p className="small">
         {t("closedOn", { date: dateLabel(close.closedAt, lang) })} ·{" "}
         {close.balanceCents < 0 ? t("closeShortfall") : t("closeLeftover")} <Money cents={Math.abs(close.balanceCents)} />
       </p>
-      {close.potCents > 0 && (
-        <p className="small">
-          {close.balanceCents > 0 ? t("closedToPot", { pot }) : t("closedFromPot", { pot })} <Money cents={close.potCents} />
-        </p>
-      )}
-      {close.carryCents !== 0 && (
-        <p className="small">
-          {t("closedCarried", { month: next })} <Money cents={close.carryCents} signed />
-        </p>
-      )}
       {close.adjustments.map((a) => (
         <p key={a.id} className="small muted">
           {t("closedAdjusted", { account: accounts.find((x) => x.id === a.accountId)?.name ?? "" })} <Money cents={a.amountCents} signed />
@@ -360,6 +491,7 @@ export default function Budget() {
   const [editing, setEditing] = useState(false);
   const [closing, setClosing] = useState<string | null>(null);
   const { data, error, reload } = useLoad(() => api.get<MonthSummary>(`/summary?month=${month}`), [month]);
+  const [params] = useSearchParams();
 
   const saved = () => {
     reload();
@@ -367,10 +499,13 @@ export default function Budget() {
   };
 
   if (!data) return <Loading error={error} />;
+  // Linked from the overview: open the expenses with no category, else the income.
+  const openLoose = params.has("uncategorised");
+  const looseExpense = data.expenses.some(isLoose);
   // Expenses split into their tables; a table with nothing planned or spent is hidden unless editing.
   const groups = EXPENSE_GROUPS.map(({ group, label }) => {
     const lines = data.expenses.filter((l) => l.group === group);
-    return { group, label: t(label), lines, shown: lines.some((l) => (editing ? l.categoryId != null : l.plannedCents || l.actualCents)) };
+    return { group, label: t(label), lines, shown: lines.some((l) => (editing ? l.categoryId != null || l.planKey : l.plannedCents || l.actualCents)) };
   });
   const closedDone = () => {
     setClosing(null);
@@ -416,14 +551,21 @@ export default function Budget() {
       {data.upcoming.length > 0 && <Upcoming data={data} />}
 
       <Section title={t("incomes")}>
-        <BudgetTable month={month} lines={data.income} editing={editing} income onSaved={saved} />
+        <BudgetTable month={month} lines={data.income} editing={editing} income openUncategorised={openLoose && !looseExpense} onSaved={saved} />
       </Section>
 
       {groups.map(
         (g) =>
           g.shown && (
             <Section key={g.group} title={g.label}>
-              <BudgetTable month={month} lines={g.lines} editing={editing} pickAccount={g.group === "variable"} onSaved={saved} />
+              <BudgetTable
+                month={month}
+                lines={g.lines}
+                editing={editing}
+                pickAccount={g.group === "variable"}
+                openUncategorised={openLoose && looseExpense}
+                onSaved={saved}
+              />
             </Section>
           ),
       )}
@@ -439,7 +581,7 @@ export default function Budget() {
       </Section>
       {!editing && <p className="muted small budget-help">{t("leftToSpendHelp")}</p>}
 
-      {data.repaid.length > 0 && <Repaid data={data} />}
+      {data.repaid.length + data.repaidDue.length > 0 && <Repaid data={data} />}
 
       <MonthSums data={data} groups={groups} />
     </div>

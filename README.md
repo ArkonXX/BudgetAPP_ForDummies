@@ -11,8 +11,9 @@ A personal budget web app based on the "My Budget" Excel workbook. It runs on a 
 | Budget (Orçamento) | Sumário: planned vs actual per category |
 | Savings (Poupanças) | Poupanças / Poupancas: savings pots, deposits and withdrawals |
 | Balance (Balanço) | Balanço and Estatísticas: month by month, per category, yearly averages |
+| Investments (Investimentos) | Investimentos and Transacoes: holdings, buys and sells, average cost, value at the quote, gain/loss |
 | Plan (Planeamento) | Main Dashboard: salary, fixed costs, subscriptions, investments, donations, annual costs, loans, Baby Steps |
-| Settings (Definições) | Language, budget month start day, categories, Excel import, backup |
+| Settings (Definições) | Language, budget month start day, categories, Excel import, backups and restore |
 
 ### Budget month
 
@@ -64,7 +65,9 @@ Nothing is saved straight away. Every line is listed for review: untick what you
 ## Data and security
 
 - All data lives in one SQLite file: `data/budget.db` (or the `./data` folder with Docker). Nothing is sent to the internet.
-- **Settings → Backup** downloads a copy of the database. Copying `data/budget.db` works too.
+- **Backups are automatic**: the server keeps one copy a day (the last 30) and one just before every Excel import, data wipe or restore (the last 20), in `data/backups` (`./data/backups` with Docker). Set `BACKUP_DIR` to keep them somewhere else, ideally another disk or a NAS folder, so a failed disk doesn't take the copies with it.
+- **Settings → Backup** lists those copies: download any of them, or restore one. You can also restore a `.db` file downloaded earlier. Before restoring, the app keeps a copy of the current data, so a restore can be undone too. You stay signed in.
+- **Settings → Backup → Download backup** downloads a copy of the database right now. Copying `data/budget.db` while the app is stopped works too.
 - The app asks for the password set in `APP_PASSWORD`. Sessions last 30 days; after 5 wrong attempts sign-in is blocked for 15 minutes.
 - Do not expose port 8080 to the internet. Use it on your home network or through a private VPN. If you put it behind HTTPS, set `COOKIE_SECURE=1`.
 

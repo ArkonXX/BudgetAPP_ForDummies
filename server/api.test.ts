@@ -205,6 +205,94 @@ test("unpaid expenses stay out of the totals and carry over until paid", async (
   assert.equal(monthSummary(db, "2026-10").totalExpenseCents, 0);
 });
 
+test("entries dated ahead only count once their day comes and they are confirmed", async () => {
+  const store = await import("./store.ts");
+  const { monthSummary } = await import("./reports.ts");
+  const db = openDb(":memory:");
+  store.updateSettings(db, { monthStartMode: "fixedDay", monthStartDay: 1 });
+  const cat = store.ensureCategory(db, "expense", "Casa");
+  const balance = () => store.listAccounts(db)[0].balanceCents;
+  const add = (kind: "expense" | "income", description: string, today: string) =>
+    store.saveTransaction(db, { kind, date: "2026-11-10", amountCents: 3000, description, categoryId: kind === "expense" ? cat : null }, today);
+
+  // Entered on the 9th for the 10th: waiting, out of the totals and the balance.
+  const rent = add("expense", "Renda", "2026-11-09");
+  const gas = add("expense", "Gás", "2026-11-09");
+  const refund = add("income", "Reembolso", "2026-11-09");
+  assert.deepEqual([rent.scheduled, rent.paid, refund.scheduled, refund.paid], [true, false, true, false]);
+  assert.equal(balance(), 0);
+  const before = monthSummary(db, "2026-11", "2026-11-09");
+  assert.equal(before.totalExpenseCents, 0);
+  assert.equal(before.totalIncomeCents, 0);
+  // Expenses still show as to pay in the month; income doesn't.
+  assert.equal(before.pendingCents, 6000);
+  assert.equal(store.listToConfirm(db, "2026-11-09").length, 0);
+
+  // On the 10th the app asks about them. Editing one keeps it waiting.
+  assert.deepEqual(store.listToConfirm(db, "2026-11-10").map((t) => t.label), ["Renda", "Gás", "Reembolso"]);
+  store.saveTransaction(db, { ...rent, description: "Renda casa" }, "2026-11-11");
+  assert.equal(store.listToConfirm(db, "2026-11-11").length, 3);
+
+  // Debited: it counts on its own date.
+  const paid = store.confirmTransaction(db, rent.id, true, "2026-11-11")!;
+  assert.deepEqual([paid.paid, paid.scheduled, paid.date], [true, false, "2026-11-10"]);
+  assert.equal(balance(), -3000);
+  // Not yet: an expense stays to pay, income is expected the next day.
+  const owed = store.confirmTransaction(db, gas.id, false, "2026-11-11")!;
+  assert.deepEqual([owed.paid, owed.scheduled], [false, false]);
+  const later = store.confirmTransaction(db, refund.id, false, "2026-11-11")!;
+  assert.deepEqual([later.paid, later.scheduled, later.date], [false, true, "2026-11-12"]);
+  assert.deepEqual(store.listToConfirm(db, "2026-11-11").map((t) => t.label), []);
+
+  const after = monthSummary(db, "2026-11", "2026-11-11");
+  assert.equal(after.totalExpenseCents, 3000);
+  assert.deepEqual(after.pending.map((t) => t.description), ["Gás"]);
+
+  // Moving one to a day that has passed means it happened then.
+  const moved = store.saveTransaction(db, { ...later, date: "2026-11-11" }, "2026-11-11");
+  assert.deepEqual([moved.paid, moved.scheduled], [true, false]);
+  assert.equal(balance(), 0);
+});
+
+test("transfers, savings and money to or from people dated ahead also wait for their day", async () => {
+  const store = await import("./store.ts");
+  const { monthSummary } = await import("./reports.ts");
+  const db = openDb(":memory:");
+  store.updateSettings(db, { monthStartMode: "fixedDay", monthStartDay: 1 });
+  const main = store.listAccounts(db)[0].id;
+  const other = store.saveAccount(db, { name: "Poupança", openingCents: 0, isDefault: false, sort: 1, archived: false } as never);
+  const pot = store.ensurePot(db, "Férias");
+  const balances = () => store.listAccounts(db).map((a) => a.balanceCents);
+  const day = "2026-11-09";
+  const date = "2026-11-10";
+
+  store.saveTransfer(db, { date, amountCents: 1000, fromAccountId: main, toAccountId: other, note: "" }, day);
+  store.saveMovement(db, { potId: pot, date, amountCents: 2000, place: "", note: "", opening: false, accountId: main }, day);
+  store.savePersonalLoan(db, { person: "Ana", direction: "lent", date: "2026-11-01", amountCents: 5000, dueDate: null, note: "", accountId: main }, "2026-11-01");
+  store.savePersonalLoan(db, { person: "Rui", direction: "borrowed", date, amountCents: 3000, dueDate: null, note: "", accountId: main }, day);
+  store.payPerson(db, { person: "Ana", direction: "lent", date, amountCents: 4000, note: "", accountId: main }, day);
+
+  // Only Ana's loan, dated on the 1st, has moved money.
+  assert.deepEqual(balances(), [-5000, 0]);
+  assert.equal(store.listPots(db)[0].balanceCents, 0);
+  assert.equal(monthSummary(db, "2026-11", day).savingsCents, 0);
+  // What Ana still owes already counts the repayment she said she'd make.
+  assert.equal(store.listPersonalLoans(db).find((l) => l.person === "Ana")!.outstandingCents, 1000);
+  assert.equal(store.listToConfirm(db, day).length, 0);
+
+  const due = store.listToConfirm(db, date);
+  assert.deepEqual(due.map((x) => [x.type, x.amountCents]), [["transfer", 1000], ["savings", -2000], ["loan", 3000], ["repayment", 4000]]);
+  for (const x of due.filter((x) => x.type !== "loan")) store.confirmScheduled(db, x.type as "transfer", x.key, true, date);
+  // Rui's money hasn't arrived: asked again tomorrow.
+  store.confirmScheduled(db, "loan", due.find((x) => x.type === "loan")!.key, false, date);
+
+  assert.deepEqual(balances(), [-5000 - 1000 - 2000 + 4000, 1000]);
+  assert.equal(store.listPots(db)[0].balanceCents, 2000);
+  assert.equal(monthSummary(db, "2026-11", date).savingsCents, 2000);
+  assert.deepEqual(store.listToConfirm(db, date).length, 0);
+  assert.deepEqual(store.listToConfirm(db, "2026-11-11").map((x) => [x.type, x.date]), [["loan", "2026-11-11"]]);
+});
+
 test("accounts keep their own balance and transfers stay out of the budget", async () => {
   const db = openDb(":memory:");
   const server = createApp(db, { password: "correct-horse", secureCookie: false }).listen(0);

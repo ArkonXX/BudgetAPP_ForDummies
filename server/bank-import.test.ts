@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { openDb } from "./db.ts";
 import { commitStatement, fixMojibake, parseAmount, parseDate, previewStatement } from "./bank-import.ts";
-import { ensureCategory, ensurePot, listAccounts, listPersonalLoans, listPots, saveAccount, savePersonalLoan, saveTransaction, saveTransfer } from "./store.ts";
+import { categoryHints, ensureCategory, ensurePot, listAccounts, listPersonalLoans, listPots, saveAccount, savePersonalLoan, saveTransaction, saveTransfer } from "./store.ts";
 
 const REVOLUT = `Type,Product,Started Date,Completed Date,Description,Amount,Fee,Currency,State,Balance
 CARD_PAYMENT,Current,2026-10-01 12:03:11,2026-10-02 09:00:00,Continente,-23.45,0.00,EUR,COMPLETED,976.55
@@ -176,4 +176,37 @@ test("personal loans: the person is suggested from the description, loans and re
 test("files that aren't statements are refused", async () => {
   const db = openDb(":memory:");
   await assert.rejects(previewStatement(db, 1, Buffer.from("hello,world\n1,2\n")), /unrecognized_statement/);
+});
+
+test("category of the last entry with the same words, ignoring card numbers, references and dates", async () => {
+  const db = openDb(":memory:");
+  const acc = saveAccount(db, { name: "Montepio", openingCents: 0, isDefault: false, sort: 1, archived: false });
+  const food = ensureCategory(db, "expense", "Supermercado");
+  const home = ensureCategory(db, "expense", "Casa");
+  saveTransaction(db, { kind: "expense", date: "2026-08-02", amountCents: 900, description: "COMPRA 1111 PINGO DOCE 02/08", categoryId: home, accountId: acc });
+  saveTransaction(db, { kind: "expense", date: "2026-09-02", amountCents: 900, description: "Compra 2222 Pingo Doce 02/09", categoryId: food, accountId: acc });
+  saveTransaction(db, { kind: "expense", date: "2026-09-05", amountCents: 500, description: "4521", categoryId: food, accountId: acc });
+
+  assert.deepEqual(
+    categoryHints(db).map((h) => [h.kind, h.description, h.categoryId]),
+    [["expense", "Compra 2222 Pingo Doce 02/09", food]],
+  );
+  const csv = `Data Mov.;Descrição;Montante\n01-10-2026;COMPRA 3333 PINGO DOCE 01/10;-12,30\n02-10-2026;4521;-5,00\n`;
+  const p = await previewStatement(db, acc, Buffer.from(csv));
+  assert.deepEqual(p.rows.map((r) => r.categoryId), [food, null]);
+});
+
+test("a loan debit the app added matches the bank's line a few days off", async () => {
+  const db = openDb(":memory:");
+  const { saveLoan } = await import("./store.ts");
+  const { chargeDebits } = await import("./subscriptions.ts");
+  const account = listAccounts(db)[0].id;
+  saveLoan(db, { name: "Credito pessoal", principalCents: 100000, monthlyCents: 7500, paidOff: false, mortgage: false, sort: 0, amortizations: [], debitDay: 1 }, "2026-10-01");
+  chargeDebits(db, "2026-10-31");
+  const csv = Buffer.from(
+    `Data Mov.;Data Valor;Descrição;Débito;Crédito;Saldo\n02-10-2026;02-10-2026;PRESTACAO EMPRESTIMO;75,00;;1.000,00\n20-10-2026;20-10-2026;OUTRA;75,00;;925,00\n`,
+    "latin1",
+  );
+  const { rows } = await previewStatement(db, account, csv);
+  assert.deepEqual(rows.map((r) => [r.date, r.duplicate]), [["2026-10-02", true], ["2026-10-20", false]]);
 });

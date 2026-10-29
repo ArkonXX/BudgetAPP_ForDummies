@@ -30,9 +30,38 @@ export interface Transaction {
   // false = an expense still to pay. It stays out of the totals and carries
   // over month after month until it is paid; its date is when it was due.
   paid: boolean;
+  // true = dated after the day it was entered: it stays unpaid (out of the
+  // totals and balances) until its day comes and it is confirmed as debited.
+  scheduled: boolean;
   accountId: number;
   // Set when the expense is one installment of a purchase paid in parts.
   installment: { planId: number; seq: number; count: number } | null;
+}
+
+/**
+ * Something dated ahead whose day has come: the app asks whether it went
+ * through. `key` is what to confirm: an entry, a transfer, a savings movement,
+ * a personal loan, or a repayment (a split one by its batch).
+ */
+export interface ToConfirm {
+  type: "entry" | "transfer" | "savings" | "loan" | "repayment";
+  key: string;
+  date: string;
+  amountCents: number; // positive = money in, negative = money out; a transfer's amount as is
+  accountId: number | null;
+  entry: Transaction | null; // the entry itself, to edit it
+  label: string; // an entry's description, a pot's name, or the note
+  person: string | null; // loans and repayments
+  potId: number | null; // savings
+  fromAccountId: number | null; // transfers
+  toAccountId: number | null;
+}
+
+/** The category last given to entries with this description (see descriptionKey). */
+export interface CategoryHint {
+  kind: Kind;
+  description: string; // as it was last written
+  categoryId: number;
 }
 
 export interface Account {
@@ -45,9 +74,6 @@ export interface Account {
   balanceCents: number; // opening + income - expenses +/- transfers - savings deposits + withdrawals +/- personal loans linked to it +/- adjustments
 }
 
-/** What closing a month does with its leftover or shortfall. */
-export type CloseAction = "carry" | "pot" | "none";
-
 export interface AccountAdjustment {
   id: number;
   accountId: number;
@@ -59,11 +85,7 @@ export interface MonthClose {
   month: string;
   closedAt: string;
   balanceCents: number; // the month's balance when it was closed
-  action: CloseAction;
-  potId: number | null;
-  potCents: number; // put in the pot (leftover) or taken out of it (shortfall)
-  carryCents: number; // passed on to the next month's balance
-  adjustments: AccountAdjustment[];
+  adjustments: AccountAdjustment[]; // balance corrections made when closing
 }
 
 export interface Transfer {
@@ -74,6 +96,7 @@ export interface Transfer {
   toAccountId: number;
   note: string;
   budgetMonth: string | null; // set when confirmed from the monthly suggestion: the month it pays for
+  scheduled: boolean; // dated ahead: out of the balances until confirmed on its day
 }
 
 // What one account needs from the salary account to pay its debits in a budget month.
@@ -125,6 +148,7 @@ export interface SavingsMovement {
   note: string;
   opening: boolean; // starting balance carried over, not counted as a deposit
   accountId: number | null; // account the money left (deposit) or went back to (withdrawal)
+  scheduled: boolean; // dated ahead: out of the pot and the balances until confirmed on its day
 }
 
 export type PlanSection = "fixed" | "subscription" | "investment" | "donation" | "annual";
@@ -139,18 +163,21 @@ export interface PlanItem {
   // Subscriptions only: debited on this day of each month (clamped to the
   // month's last day) and then added as a paid expense automatically.
   debitDay: number | null;
-  categoryId: number | null; // null = the "Subscrições" category
+  // The expense category it counts in on the Budget and Year plan. Null: its
+  // own line there (subscriptions: the "Subscrições" category).
+  categoryId: number | null;
   accountId: number | null; // the account it is paid from; null = the default account
 }
 
-// A subscription debit still to come in a budget month.
+// A subscription or bank loan debit still to come in a budget month.
 export interface UpcomingDebit {
-  itemId: number;
+  source: "plan" | "loan"; // a subscription on the Plan, or a bank loan
+  itemId: number; // the plan item's or the loan's id
   name: string;
   date: string;
   amountCents: number;
   categoryId: number | null;
-  accountId: number; // the subscription's account, or the default one
+  accountId: number; // the subscription's or loan's account, or the default one
 }
 
 // Money that moved because of a personal loan, shown with the entries.
@@ -162,6 +189,7 @@ export interface LoanMove {
   amountCents: number; // positive = money in, negative = money out
   accountId: number | null; // null = no account was chosen
   note: string;
+  scheduled: boolean;
 }
 
 export interface Loan {
@@ -173,6 +201,10 @@ export interface Loan {
   mortgage: boolean; // the house loan: left out of Baby Step 2, it is Baby Step 6
   sort: number;
   accountId: number | null; // the account the monthly payment leaves from; null = the default account
+  categoryId: number | null; // the expense category it counts in on the Budget; null = its own line
+  // Debited on this day of each month (clamped to the month's last day) and
+  // then added as a paid expense automatically, while not paid off.
+  debitDay: number | null;
   amortizations: { year: number; amountCents: number }[];
 }
 
@@ -187,6 +219,9 @@ export interface PersonalLoanPayment {
   note: string;
   batch: string | null; // set when one repayment to a person was split across several loans
   accountId: number | null; // the account the money came into or left; null = not tracked
+  // Dated ahead: out of the balances and the budget until confirmed on its day,
+  // but already taken off what is owed.
+  scheduled: boolean;
 }
 
 export interface PersonalLoan {
@@ -198,6 +233,7 @@ export interface PersonalLoan {
   dueDate: string | null;
   note: string;
   accountId: number | null; // the account the money came into or left; null = not tracked
+  scheduled: boolean; // dated ahead: out of the balances until confirmed on its day
   payments: PersonalLoanPayment[];
   paidCents: number;
   outstandingCents: number;
@@ -242,6 +278,10 @@ export interface SummaryLine {
   // Expenses only: still to pay by the end of the month (carried over and
   // installments) plus subscription debits still to come.
   toPayCents: number;
+  // Expenses only: the Plan lines and bank loans that make up what is planned.
+  fromPlan: string[];
+  // A Plan line or bank loan with no category, shown as its own line.
+  planKey?: string;
 }
 
 export interface MonthSummary {
@@ -266,10 +306,12 @@ export interface MonthSummary {
   // nowhere; it only counts in the month it is paid back.
   repaid: { person: string; cents: number }[];
   repaidCents: number;
-  carriedInCents: number; // leftover (or shortfall) passed on by closing the month before; in balanceCents
+  // What I will pay back to people in the month: repayments dated ahead and what is owed by a "due by"
+  // date in it (on the current month, also overdue).
+  repaidDue: { person: string; cents: number }[];
+  repaidDueCents: number;
   close: MonthClose | null; // set once the month is closed
   canClose: boolean; // a past month not closed yet
-  canReopen: boolean; // closed, and the month after is not
   previousOpen: string | null; // on the current month: the month before, when it has entries and is not closed
 }
 
@@ -289,6 +331,8 @@ export interface PlanRow {
   name: string; // repaid: the person
   group: ExpenseGroup; // expense rows
   cells: PlanCell[];
+  fromPlan: string[]; // the Plan lines and bank loans that make up what is planned
+  planLine?: boolean; // a Plan line or bank loan with no category
 }
 
 export interface PlanMonth {
@@ -352,6 +396,50 @@ export interface Overview {
   pots: SavingsPot[];
   tips: Tip[];
   debts: Debts;
+  // Only for the month in progress: what is free to spend until it ends.
+  available: Available | null;
+  todo: Todo[];
+  netWorth: NetWorth;
+}
+
+// Money in the accounts today less what still has to leave them this month.
+export interface Available {
+  accountsCents: number; // every account's balance today
+  toPayCents: number; // unpaid expenses due by month end plus debits still to come
+  fixedLeftCents: number; // fixed costs and loans planned but not paid or due yet
+  savingsLeftCents: number; // planned savings not deposited yet
+  freeCents: number; // accounts - toPay - fixedLeft - savingsLeft
+  daysLeft: number; // today included
+  dayToDayLeftCents: number; // what the day-to-day categories still have in the budget
+}
+
+// Things worth doing, shown on the overview with a link to where they are done.
+export type TodoType =
+  | "closeMonth" // name: the month to close
+  | "uncategorised" // count: entries of the month with no category
+  | "pending" // unpaid expenses due by month end; level bad when one is late
+  | "debitsSoon" // debits in the next 7 days; name: the first one
+  | "shortAccount" // name: an account that can't pay what leaves it this month
+  | "savingsBehind"
+  | "annualNext"; // name: a yearly Plan item due next month
+
+export interface Todo {
+  type: TodoType;
+  level: "bad" | "warn" | "info";
+  name: string;
+  count: number;
+  amountCents: number;
+  compareCents: number;
+}
+
+// Everything owned less everything owed, as the app knows it (bank loans have no balance here).
+export interface NetWorth {
+  accountsCents: number;
+  potsCents: number;
+  owedToMeCents: number;
+  iOweCents: number;
+  installmentsLeftCents: number;
+  totalCents: number;
 }
 
 // What is still owed today, for the overview: personal loans by person and
@@ -380,4 +468,53 @@ export interface StatementRow {
 export interface StatementPreview {
   format: "revolut" | "bank";
   rows: StatementRow[];
+}
+
+export type BackupReason = "daily" | "before-import" | "before-wipe" | "before-restore";
+
+/** A copy of the database kept on the server. createdAt is local time, "2026-10-29T03:00:00". */
+export interface BackupFile {
+  name: string;
+  createdAt: string;
+  reason: BackupReason;
+  sizeBytes: number;
+}
+
+export type InvestmentKind = "stock" | "etf" | "crypto" | "fund" | "other";
+export type TradeSide = "buy" | "sell";
+
+/** A buy or sell, like a row of the spreadsheet's Transacoes sheet. totalCents is what was paid or received in EUR, fees included. */
+export interface InvestmentTrade {
+  id: number;
+  investmentId: number;
+  date: string;
+  side: TradeSide;
+  quantity: number;
+  totalCents: number;
+  note: string;
+}
+
+/** One holding, like a row of the Investimentos sheet. Values in EUR; the quote is per unit. */
+export interface Investment {
+  id: number;
+  ticker: string;
+  name: string;
+  kind: InvestmentKind;
+  quote: number | null;
+  quoteDate: string | null;
+  quantity: number;
+  costCents: number; // what the units still held cost (average cost × quantity)
+  averageCost: number | null; // per unit
+  valueCents: number; // quantity × quote (cost when there is no quote yet)
+  gainCents: number; // value − cost
+  realizedCents: number; // gain or loss on what was sold
+  trades: InvestmentTrade[]; // newest first
+}
+
+export interface Portfolio {
+  investments: Investment[];
+  valueCents: number;
+  costCents: number;
+  gainCents: number;
+  realizedCents: number;
 }

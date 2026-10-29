@@ -1,10 +1,12 @@
 import type { DB } from "./db.ts";
 import { getSetting, guessExpenseGroup, setSetting, tx } from "./db.ts";
 import { installmentDate, monthOf, monthStartOf, todayISO } from "../shared/period.ts";
+import { descriptionKey } from "../shared/describe.ts";
 import type {
   Account,
   BabyStepSettings,
   Category,
+  CategoryHint,
   InstallmentPlan,
   Kind,
   Loan,
@@ -18,6 +20,7 @@ import type {
   SavingsMovement,
   SavingsPot,
   Settings,
+  ToConfirm,
   Transaction,
   Transfer,
   ExpenseGroup,
@@ -44,6 +47,7 @@ const toTransaction = (r: Row): Transaction => ({
   description: String(r.description),
   categoryId: r.category_id == null ? null : Number(r.category_id),
   paid: Boolean(r.paid),
+  scheduled: Boolean(r.scheduled),
   accountId: Number(r.account_id),
   installment:
     r.plan_id == null
@@ -205,25 +209,67 @@ export function listTransactions(
   return (db.prepare(sql).all(...params) as Row[]).map(toTransaction);
 }
 
+/**
+ * For each kind and description key, the category of the latest entry with it,
+ * so a repeated shop comes with its category already picked. Newest first.
+ */
+export function categoryHints(db: DB): CategoryHint[] {
+  const rows = db
+    .prepare(
+      `SELECT t.kind, t.description, t.category_id FROM transactions t JOIN categories c ON c.id = t.category_id
+        WHERE c.archived = 0 AND t.description <> '' ORDER BY t.date DESC, t.id DESC`,
+    )
+    .all() as { kind: Kind; description: string; category_id: number }[];
+  const hints = new Map<string, CategoryHint>();
+  for (const r of rows) {
+    const key = `${r.kind}|${descriptionKey(r.description)}`;
+    if (!key.endsWith("|") && !hints.has(key))
+      hints.set(key, { kind: r.kind, description: r.description, categoryId: Number(r.category_id) });
+  }
+  return [...hints.values()];
+}
+
+/**
+ * Whether a row dated `date` waits for its day and a confirmation that it went
+ * through: it is dated after today, or it was already waiting and its date is
+ * left as it was.
+ */
+function waits(db: DB, table: string, id: number | undefined, date: string, today: string): 0 | 1 {
+  if (date > today) return 1;
+  const old = id ? (db.prepare(`SELECT date, scheduled FROM ${table} WHERE id = ?`).get(id) as { date: string; scheduled: number } | undefined) : undefined;
+  return old?.scheduled === 1 && old.date === date ? 1 : 0;
+}
+
 export function saveTransaction(
   db: DB,
-  t: Omit<Transaction, "id" | "paid" | "accountId" | "installment"> & { id?: number; paid?: boolean; accountId?: number | null },
+  t: Omit<Transaction, "id" | "paid" | "scheduled" | "accountId" | "installment"> & { id?: number; paid?: boolean; accountId?: number | null },
+  today = todayISO(),
 ): Transaction {
   let id = t.id;
+  const old = id
+    ? (db.prepare("SELECT date, scheduled, plan_id FROM transactions WHERE id = ?").get(id) as
+        | { date: string; scheduled: number; plan_id: number | null }
+        | undefined)
+    : undefined;
+  // An entry dated after today waits for its day and a confirmation that it was
+  // debited, and so does one still waiting whose date is left as it was.
+  // Installments follow their purchase instead.
+  const scheduled =
+    old?.plan_id == null && (t.date > today || (old?.scheduled === 1 && old.date === t.date)) ? 1 : 0;
   // Only expenses can be left unpaid.
-  const paid = t.kind === "income" || t.paid !== false ? 1 : 0;
+  const paid = !scheduled && (t.kind === "income" || t.paid !== false) ? 1 : 0;
   const accountId = t.accountId ?? null;
   if (id) {
     db.prepare(
-      "UPDATE transactions SET kind = ?, date = ?, amount_cents = ?, description = ?, category_id = ?, paid = ?, account_id = ? WHERE id = ?",
-    ).run(t.kind, t.date, t.amountCents, t.description, t.categoryId, paid, accountId, id);
+      "UPDATE transactions SET kind = ?, date = ?, amount_cents = ?, description = ?, category_id = ?, paid = ?, scheduled = ?, account_id = ? WHERE id = ?",
+    ).run(t.kind, t.date, t.amountCents, t.description, t.categoryId, paid, scheduled, accountId, id);
   } else {
     id = Number(
       db
         .prepare(
-          "INSERT INTO transactions (kind, date, amount_cents, description, category_id, paid, account_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO transactions (kind, date, amount_cents, description, category_id, paid, scheduled, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .run(t.kind, t.date, t.amountCents, t.description, t.categoryId, paid, accountId).lastInsertRowid,
+        .run(t.kind, t.date, t.amountCents, t.description, t.categoryId, paid, scheduled, accountId).lastInsertRowid,
     );
   }
   return getTransaction(db, id)!;
@@ -236,7 +282,7 @@ function getTransaction(db: DB, id: number): Transaction | null {
 
 /** Marks an unpaid expense as paid on the given date, so it counts in that month. */
 export function payTransaction(db: DB, id: number, date: string): Transaction | null {
-  db.prepare("UPDATE transactions SET paid = 1, date = ? WHERE id = ? AND paid = 0").run(date, id);
+  db.prepare("UPDATE transactions SET paid = 1, scheduled = 0, date = ? WHERE id = ? AND paid = 0").run(date, id);
   return getTransaction(db, id);
 }
 
@@ -244,9 +290,79 @@ export function payTransaction(db: DB, id: number, date: string): Transaction | 
 export function listPending(db: DB, to: string): Transaction[] {
   return (
     db
-      .prepare(`${TX_SELECT} WHERE t.paid = 0 AND t.date < ? ORDER BY t.date, t.id`)
+      .prepare(`${TX_SELECT} WHERE t.kind = 'expense' AND t.paid = 0 AND t.date < ? ORDER BY t.date, t.id`)
       .all(to) as Row[]
   ).map(toTransaction);
+}
+
+/**
+ * Everything dated ahead whose day has come, oldest first: entries, transfers,
+ * savings movements, personal loans and repayments. The app asks if they went through.
+ */
+export function listToConfirm(db: DB, today = todayISO()): ToConfirm[] {
+  const none = { entry: null, person: null, potId: null, fromAccountId: null, toAccountId: null };
+  const out: ToConfirm[] = [];
+  for (const r of db.prepare(`${TX_SELECT} WHERE t.scheduled = 1 AND t.date <= ?`).all(today) as Row[]) {
+    const t = toTransaction(r);
+    out.push({ ...none, type: "entry", key: String(t.id), date: t.date, amountCents: t.kind === "expense" ? -t.amountCents : t.amountCents, accountId: t.accountId, entry: t, label: t.description });
+  }
+  for (const r of db.prepare("SELECT * FROM transfers WHERE scheduled = 1 AND date <= ?").all(today) as Row[])
+    out.push({ ...none, type: "transfer", key: String(r.id), date: String(r.date), amountCents: Number(r.amount_cents), accountId: null, label: String(r.note), fromAccountId: Number(r.from_account_id), toAccountId: Number(r.to_account_id) });
+  const savings = db
+    .prepare("SELECT m.*, p.name AS pot FROM savings_movements m JOIN savings_pots p ON p.id = m.pot_id WHERE m.scheduled = 1 AND m.date <= ?")
+    .all(today) as Row[];
+  for (const r of savings)
+    // A deposit leaves the account, a withdrawal comes back to it.
+    out.push({ ...none, type: "savings", key: String(r.id), date: String(r.date), amountCents: -Number(r.amount_cents), accountId: r.account_id == null ? null : Number(r.account_id), label: String(r.pot), potId: Number(r.pot_id) });
+  for (const r of db.prepare("SELECT * FROM personal_loans WHERE scheduled = 1 AND date <= ?").all(today) as Row[])
+    out.push({ ...none, type: "loan", key: String(r.id), date: String(r.date), amountCents: r.direction === "borrowed" ? Number(r.amount_cents) : -Number(r.amount_cents), accountId: r.account_id == null ? null : Number(r.account_id), label: String(r.note), person: String(r.person).trim() });
+  const repayments = db
+    .prepare(
+      `SELECT COALESCE('b' || p.batch, '#' || p.id) AS key, MIN(p.date) AS date, l.person, l.direction, SUM(p.amount_cents) AS cents, p.account_id, p.note
+         FROM personal_loan_payments p JOIN personal_loans l ON l.id = p.loan_id
+        WHERE p.scheduled = 1 AND p.date <= ? GROUP BY key`,
+    )
+    .all(today) as Row[];
+  for (const r of repayments)
+    out.push({ ...none, type: "repayment", key: String(r.key), date: String(r.date), amountCents: r.direction === "lent" ? Number(r.cents) : -Number(r.cents), accountId: r.account_id == null ? null : Number(r.account_id), label: String(r.note), person: String(r.person).trim() });
+  return out.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+const CONFIRM_TABLES = { transfer: "transfers", savings: "savings_movements", loan: "personal_loans", repayment: "personal_loan_payments" } as const;
+
+/** The table and rows behind something to confirm (a split repayment is all of its parts). */
+export function confirmTarget(type: keyof typeof CONFIRM_TABLES, key: string): { table: string; where: string; param: string | number } {
+  const table = CONFIRM_TABLES[type];
+  if (type === "repayment" && key.startsWith("b")) return { table, where: "batch = ?", param: key.slice(1) };
+  return { table, where: "id = ?", param: Number(key.replace(/^#/, "")) };
+}
+
+/**
+ * Answers whether a transfer, savings movement, loan or repayment dated ahead
+ * went through on its day. Yes: it counts on that date. No: it is expected the next day.
+ */
+export function confirmScheduled(db: DB, type: keyof typeof CONFIRM_TABLES, key: string, done: boolean, today = todayISO()): void {
+  const { table, where, param } = confirmTarget(type, key);
+  const due = `${where} AND scheduled = 1 AND date <= ?`;
+  if (done) db.prepare(`UPDATE ${table} SET scheduled = 0 WHERE ${due}`).run(param, today);
+  else db.prepare(`UPDATE ${table} SET date = ? WHERE ${due}`).run(installmentDate(today, 1, 1), param, today);
+}
+
+/**
+ * Answers whether an entry dated ahead went through on its day. Yes: it counts
+ * on that date. No: an expense becomes still to pay, and income is expected
+ * again the next day.
+ */
+export function confirmTransaction(db: DB, id: number, done: boolean, today = todayISO()): Transaction | null {
+  const row = db.prepare("SELECT kind, date FROM transactions WHERE id = ? AND scheduled = 1").get(id) as
+    | { kind: Kind; date: string }
+    | undefined;
+  if (row && row.date <= today) {
+    if (done) db.prepare("UPDATE transactions SET paid = 1, scheduled = 0 WHERE id = ?").run(id);
+    else if (row.kind === "expense") db.prepare("UPDATE transactions SET scheduled = 0 WHERE id = ?").run(id);
+    else db.prepare("UPDATE transactions SET date = ? WHERE id = ?").run(installmentDate(today, 1, 1), id);
+  }
+  return getTransaction(db, id);
 }
 
 /**
@@ -351,13 +467,13 @@ export function listAccounts(db: DB): Account[] {
       `SELECT a.*, a.opening_cents
          + COALESCE((SELECT SUM(CASE WHEN kind = 'income' THEN amount_cents ELSE -amount_cents END)
                      FROM transactions WHERE ${ACCOUNT_OF} = a.id AND paid = 1), 0)
-         + COALESCE((SELECT SUM(amount_cents) FROM transfers WHERE to_account_id = a.id), 0)
-         - COALESCE((SELECT SUM(amount_cents) FROM transfers WHERE from_account_id = a.id), 0)
-         - COALESCE((SELECT SUM(amount_cents) FROM savings_movements WHERE account_id = a.id AND opening = 0), 0)
+         + COALESCE((SELECT SUM(amount_cents) FROM transfers WHERE to_account_id = a.id AND scheduled = 0), 0)
+         - COALESCE((SELECT SUM(amount_cents) FROM transfers WHERE from_account_id = a.id AND scheduled = 0), 0)
+         - COALESCE((SELECT SUM(amount_cents) FROM savings_movements WHERE account_id = a.id AND opening = 0 AND scheduled = 0), 0)
          + COALESCE((SELECT SUM(CASE direction WHEN 'borrowed' THEN amount_cents ELSE -amount_cents END)
-                     FROM personal_loans WHERE account_id = a.id), 0)
+                     FROM personal_loans WHERE account_id = a.id AND scheduled = 0), 0)
          + COALESCE((SELECT SUM(CASE l.direction WHEN 'lent' THEN p.amount_cents ELSE -p.amount_cents END)
-                     FROM personal_loan_payments p JOIN personal_loans l ON l.id = p.loan_id WHERE p.account_id = a.id), 0)
+                     FROM personal_loan_payments p JOIN personal_loans l ON l.id = p.loan_id WHERE p.account_id = a.id AND p.scheduled = 0), 0)
          + COALESCE((SELECT SUM(amount_cents) FROM account_adjustments WHERE account_id = a.id), 0) AS balance
        FROM accounts a ORDER BY a.sort, a.id`,
     )
@@ -440,6 +556,7 @@ const toTransfer = (r: Row): Transfer => ({
   toAccountId: Number(r.to_account_id),
   note: String(r.note),
   budgetMonth: r.budget_month == null ? null : String(r.budget_month),
+  scheduled: Boolean(r.scheduled),
 });
 
 export function listTransfers(db: DB, opts: { from?: string; to?: string } = {}): Transfer[] {
@@ -452,19 +569,24 @@ export function listTransfers(db: DB, opts: { from?: string; to?: string } = {})
 }
 
 /** Saves a transfer. An edit keeps the budget month it was confirmed for. */
-export function saveTransfer(db: DB, t: Omit<Transfer, "id" | "budgetMonth"> & { id?: number; budgetMonth?: string | null }): number {
+export function saveTransfer(
+  db: DB,
+  t: Omit<Transfer, "id" | "budgetMonth" | "scheduled"> & { id?: number; budgetMonth?: string | null },
+  today = todayISO(),
+): number {
+  const scheduled = waits(db, "transfers", t.id, t.date, today);
   if (t.id) {
     db.prepare(
-      "UPDATE transfers SET date = ?, amount_cents = ?, from_account_id = ?, to_account_id = ?, note = ? WHERE id = ?",
-    ).run(t.date, t.amountCents, t.fromAccountId, t.toAccountId, t.note, t.id);
+      "UPDATE transfers SET date = ?, amount_cents = ?, from_account_id = ?, to_account_id = ?, note = ?, scheduled = ? WHERE id = ?",
+    ).run(t.date, t.amountCents, t.fromAccountId, t.toAccountId, t.note, scheduled, t.id);
     return t.id;
   }
   return Number(
     db
       .prepare(
-        "INSERT INTO transfers (date, amount_cents, from_account_id, to_account_id, note, budget_month) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO transfers (date, amount_cents, from_account_id, to_account_id, note, budget_month, scheduled) VALUES (?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(t.date, t.amountCents, t.fromAccountId, t.toAccountId, t.note, t.budgetMonth ?? null).lastInsertRowid,
+      .run(t.date, t.amountCents, t.fromAccountId, t.toAccountId, t.note, t.budgetMonth ?? null, scheduled).lastInsertRowid,
   );
 }
 
@@ -478,7 +600,7 @@ export function listPots(db: DB): SavingsPot[] {
   const rows = db
     .prepare(
       `SELECT p.*, COALESCE(SUM(m.amount_cents), 0) AS balance
-       FROM savings_pots p LEFT JOIN savings_movements m ON m.pot_id = p.id
+       FROM savings_pots p LEFT JOIN savings_movements m ON m.pot_id = p.id AND m.scheduled = 0
        GROUP BY p.id ORDER BY p.sort, p.name`,
     )
     .all() as Row[];
@@ -538,26 +660,30 @@ export function listMovements(db: DB, potId?: number): SavingsMovement[] {
     note: String(r.note),
     opening: Boolean(r.opening),
     accountId: r.account_id == null ? null : Number(r.account_id),
+    scheduled: Boolean(r.scheduled),
   }));
 }
 
 export function saveMovement(
   db: DB,
-  m: Omit<SavingsMovement, "id" | "accountId"> & { id?: number; accountId?: number | null },
+  m: Omit<SavingsMovement, "id" | "accountId" | "scheduled"> & { id?: number; accountId?: number | null },
+  today = todayISO(),
 ): number {
   const accountId = m.accountId ?? null;
+  // A starting balance is not money moved, so it never waits.
+  const scheduled = m.opening ? 0 : waits(db, "savings_movements", m.id, m.date, today);
   if (m.id) {
     db.prepare(
-      "UPDATE savings_movements SET pot_id = ?, date = ?, amount_cents = ?, place = ?, note = ?, opening = ?, account_id = ? WHERE id = ?",
-    ).run(m.potId, m.date, m.amountCents, m.place, m.note, m.opening ? 1 : 0, accountId, m.id);
+      "UPDATE savings_movements SET pot_id = ?, date = ?, amount_cents = ?, place = ?, note = ?, opening = ?, account_id = ?, scheduled = ? WHERE id = ?",
+    ).run(m.potId, m.date, m.amountCents, m.place, m.note, m.opening ? 1 : 0, accountId, scheduled, m.id);
     return m.id;
   }
   return Number(
     db
       .prepare(
-        "INSERT INTO savings_movements (pot_id, date, amount_cents, place, note, opening, account_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO savings_movements (pot_id, date, amount_cents, place, note, opening, account_id, scheduled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(m.potId, m.date, m.amountCents, m.place, m.note, m.opening ? 1 : 0, accountId).lastInsertRowid,
+      .run(m.potId, m.date, m.amountCents, m.place, m.note, m.opening ? 1 : 0, accountId, scheduled).lastInsertRowid,
   );
 }
 
@@ -634,14 +760,23 @@ export function listLoans(db: DB): Loan[] {
     mortgage: Boolean(l.mortgage),
     sort: Number(l.sort),
     accountId: l.account_id == null ? null : Number(l.account_id),
+    categoryId: l.category_id == null ? null : Number(l.category_id),
+    debitDay: l.debit_day == null ? null : Number(l.debit_day),
     amortizations: amort
       .filter((a) => Number(a.loan_id) === Number(l.id))
       .map((a) => ({ year: Number(a.year), amountCents: Number(a.amount_cents) })),
   }));
 }
 
-/** Saves a bank loan; leaving `accountId` out keeps the account it has. */
-export function saveLoan(db: DB, l: Omit<Loan, "id" | "accountId"> & { id?: number; accountId?: number | null }): number {
+type LoanInput = Omit<Loan, "id" | "accountId" | "categoryId" | "debitDay"> & {
+  id?: number;
+  accountId?: number | null;
+  categoryId?: number | null;
+  debitDay?: number | null;
+};
+
+/** Saves a bank loan; leaving `accountId`, `categoryId` or `debitDay` out keeps what it has. */
+export function saveLoan(db: DB, l: LoanInput, today = todayISO()): number {
   return tx(db, () => {
     let id = l.id;
     if (id) {
@@ -650,13 +785,27 @@ export function saveLoan(db: DB, l: Omit<Loan, "id" | "accountId"> & { id?: numb
       ).run(l.name, l.principalCents, l.monthlyCents, l.paidOff ? 1 : 0, l.mortgage ? 1 : 0, l.sort, id);
       db.prepare("DELETE FROM loan_amortizations WHERE loan_id = ?").run(id);
       if (l.accountId !== undefined) db.prepare("UPDATE loans SET account_id = ? WHERE id = ?").run(l.accountId, id);
+      if (l.categoryId !== undefined) db.prepare("UPDATE loans SET category_id = ? WHERE id = ?").run(l.categoryId, id);
+      if (l.debitDay !== undefined) setLoanDebitDay(db, id, l.debitDay, today);
     } else {
       id = Number(
         db
           .prepare(
-            "INSERT INTO loans (name, principal_cents, monthly_cents, paid_off, mortgage, sort, account_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            `INSERT INTO loans (name, principal_cents, monthly_cents, paid_off, mortgage, sort, account_id, category_id, debit_day, charge_from)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
-          .run(l.name, l.principalCents, l.monthlyCents, l.paidOff ? 1 : 0, l.mortgage ? 1 : 0, l.sort, l.accountId ?? null)
+          .run(
+            l.name,
+            l.principalCents,
+            l.monthlyCents,
+            l.paidOff ? 1 : 0,
+            l.mortgage ? 1 : 0,
+            l.sort,
+            l.accountId ?? null,
+            l.categoryId ?? null,
+            l.debitDay ?? null,
+            l.debitDay == null ? null : today,
+          )
           .lastInsertRowid,
       );
     }
@@ -670,6 +819,20 @@ export function saveLoan(db: DB, l: Omit<Loan, "id" | "accountId"> & { id?: numb
 
 export function setLoanAccount(db: DB, id: number, accountId: number | null): void {
   db.prepare("UPDATE loans SET account_id = ? WHERE id = ?").run(accountId, id);
+}
+
+export function setLoanCategory(db: DB, id: number, categoryId: number | null): void {
+  db.prepare("UPDATE loans SET category_id = ? WHERE id = ?").run(categoryId, id);
+}
+
+/** Sets the day a loan's payment is debited; `today` is when automatic expenses start. */
+export function setLoanDebitDay(db: DB, id: number, debitDay: number | null, today = todayISO()): void {
+  const before = db.prepare("SELECT debit_day, charge_from FROM loans WHERE id = ?").get(id) as
+    | { debit_day: number | null; charge_from: string | null }
+    | undefined;
+  // Keep the start date while a day stays set, so changing the day doesn't charge a month twice.
+  const chargeFrom = debitDay == null ? null : before?.debit_day == null ? today : before.charge_from ?? today;
+  db.prepare("UPDATE loans SET debit_day = ?, charge_from = ? WHERE id = ?").run(debitDay, chargeFrom, id);
 }
 
 export function deleteLoan(db: DB, id: number): void {
@@ -691,6 +854,7 @@ export function listPersonalLoans(db: DB): PersonalLoan[] {
       note: String(p.note),
       batch: p.batch == null ? null : String(p.batch),
       accountId: p.account_id == null ? null : Number(p.account_id),
+      scheduled: Boolean(p.scheduled),
     }),
   );
   return loans.map((l) => {
@@ -705,6 +869,7 @@ export function listPersonalLoans(db: DB): PersonalLoan[] {
       dueDate: l.due_date == null ? null : String(l.due_date),
       note: String(l.note),
       accountId: l.account_id == null ? null : Number(l.account_id),
+      scheduled: Boolean(l.scheduled),
       payments: own,
       paidCents: paid,
       outstandingCents: Number(l.amount_cents) - paid,
@@ -714,20 +879,22 @@ export function listPersonalLoans(db: DB): PersonalLoan[] {
 
 export function savePersonalLoan(
   db: DB,
-  l: Omit<PersonalLoan, "id" | "payments" | "paidCents" | "outstandingCents" | "accountId"> & { id?: number; accountId?: number | null },
+  l: Omit<PersonalLoan, "id" | "payments" | "paidCents" | "outstandingCents" | "accountId" | "scheduled"> & { id?: number; accountId?: number | null },
+  today = todayISO(),
 ): number {
+  const scheduled = waits(db, "personal_loans", l.id, l.date, today);
   if (l.id) {
     db.prepare(
-      "UPDATE personal_loans SET person = ?, direction = ?, date = ?, amount_cents = ?, due_date = ?, note = ? WHERE id = ?",
-    ).run(l.person, l.direction, l.date, l.amountCents, l.dueDate, l.note, l.id);
+      "UPDATE personal_loans SET person = ?, direction = ?, date = ?, amount_cents = ?, due_date = ?, note = ?, scheduled = ? WHERE id = ?",
+    ).run(l.person, l.direction, l.date, l.amountCents, l.dueDate, l.note, scheduled, l.id);
     return l.id;
   }
   return Number(
     db
       .prepare(
-        "INSERT INTO personal_loans (person, direction, date, amount_cents, due_date, note, account_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO personal_loans (person, direction, date, amount_cents, due_date, note, account_id, scheduled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(l.person, l.direction, l.date, l.amountCents, l.dueDate, l.note, l.accountId ?? null).lastInsertRowid,
+      .run(l.person, l.direction, l.date, l.amountCents, l.dueDate, l.note, l.accountId ?? null, scheduled).lastInsertRowid,
   );
 }
 
@@ -737,20 +904,22 @@ export function deletePersonalLoan(db: DB, id: number): void {
 
 export function savePersonalLoanPayment(
   db: DB,
-  p: Omit<PersonalLoanPayment, "id" | "batch" | "accountId"> & { id?: number },
+  p: Omit<PersonalLoanPayment, "id" | "batch" | "accountId" | "scheduled"> & { id?: number },
+  today = todayISO(),
 ): number {
+  const scheduled = waits(db, "personal_loan_payments", p.id, p.date, today);
   if (p.id) {
     db.prepare(
-      "UPDATE personal_loan_payments SET loan_id = ?, date = ?, amount_cents = ?, note = ? WHERE id = ?",
-    ).run(p.loanId, p.date, p.amountCents, p.note, p.id);
+      "UPDATE personal_loan_payments SET loan_id = ?, date = ?, amount_cents = ?, note = ?, scheduled = ? WHERE id = ?",
+    ).run(p.loanId, p.date, p.amountCents, p.note, scheduled, p.id);
     return p.id;
   }
   return Number(
     db
       .prepare(
-        "INSERT INTO personal_loan_payments (loan_id, date, amount_cents, note) VALUES (?, ?, ?, ?)",
+        "INSERT INTO personal_loan_payments (loan_id, date, amount_cents, note, scheduled) VALUES (?, ?, ?, ?, ?)",
       )
-      .run(p.loanId, p.date, p.amountCents, p.note).lastInsertRowid,
+      .run(p.loanId, p.date, p.amountCents, p.note, scheduled).lastInsertRowid,
   );
 }
 
@@ -768,6 +937,7 @@ export const personKey = (person: string) => person.trim().toLocaleLowerCase("pt
 export function payPerson(
   db: DB,
   p: { person: string; direction: PersonalLoanDirection; date: string; amountCents: number; note: string; accountId?: number | null },
+  today = todayISO(),
 ): { batch: string; paid: number } | null {
   return tx(db, () => {
     const open = listPersonalLoans(db)
@@ -776,14 +946,14 @@ export function payPerson(
     if (p.amountCents > open.reduce((a, l) => a + l.outstandingCents, 0)) return null;
     const batch = crypto.randomUUID();
     const ins = db.prepare(
-      "INSERT INTO personal_loan_payments (loan_id, date, amount_cents, note, batch, account_id) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT INTO personal_loan_payments (loan_id, date, amount_cents, note, batch, account_id, scheduled) VALUES (?, ?, ?, ?, ?, ?, ?)",
     );
     let left = p.amountCents;
     let paid = 0;
     for (const l of open) {
       if (left === 0) break;
       const part = Math.min(left, l.outstandingCents);
-      ins.run(l.id, p.date, part, p.note, batch, p.accountId ?? null);
+      ins.run(l.id, p.date, part, p.note, batch, p.accountId ?? null, p.date > today ? 1 : 0);
       left -= part;
       paid++;
     }
@@ -805,6 +975,7 @@ export function listLoanMoves(db: DB, from: string, to: string): LoanMove[] {
         amountCents: l.direction === "borrowed" ? l.amountCents : -l.amountCents,
         accountId: l.accountId,
         note: l.note,
+        scheduled: l.scheduled,
       });
     for (const p of l.payments) {
       if (p.date < from || p.date >= to) continue;
@@ -814,7 +985,7 @@ export function listLoanMoves(db: DB, from: string, to: string): LoanMove[] {
         same.amountCents += cents;
         continue;
       }
-      const move = { key: `p${p.batch ?? p.id}`, date: p.date, person: l.person.trim(), repay: true, amountCents: cents, accountId: p.accountId, note: p.note };
+      const move = { key: `p${p.batch ?? p.id}`, date: p.date, person: l.person.trim(), repay: true, amountCents: cents, accountId: p.accountId, note: p.note, scheduled: p.scheduled };
       if (p.batch) batches.set(p.batch, move);
       moves.push(move);
     }
@@ -856,11 +1027,12 @@ export function wipeData(db: DB): void {
   tx(db, () => {
     db.exec(`
       DELETE FROM account_adjustments; DELETE FROM month_closes;
-      DELETE FROM plan_charges; DELETE FROM transactions; DELETE FROM installment_plans;
+      DELETE FROM plan_charges; DELETE FROM loan_charges; DELETE FROM transactions; DELETE FROM installment_plans;
       DELETE FROM transfers; DELETE FROM savings_movements; DELETE FROM savings_pots;
       DELETE FROM plan_items; DELETE FROM loan_amortizations; DELETE FROM loans;
       DELETE FROM personal_loan_payments; DELETE FROM personal_loans;
       DELETE FROM savings_month_plans; DELETE FROM category_month_plans;
+      DELETE FROM investment_trades; DELETE FROM investments;
       DELETE FROM categories; DELETE FROM accounts;
       INSERT INTO accounts (name, is_default) VALUES ('Conta principal', 1);
     `);
@@ -875,16 +1047,7 @@ export function getClose(db: DB, month: string): MonthClose | null {
   const adjustments = (
     db.prepare("SELECT * FROM account_adjustments WHERE close_month = ? ORDER BY id").all(month) as Row[]
   ).map((a) => ({ id: Number(a.id), accountId: Number(a.account_id), date: String(a.date), amountCents: Number(a.amount_cents) }));
-  return {
-    month,
-    closedAt: String(r.closed_at),
-    balanceCents: Number(r.balance_cents),
-    action: r.action as MonthClose["action"],
-    potId: r.pot_id == null ? null : Number(r.pot_id),
-    potCents: Number(r.pot_cents),
-    carryCents: Number(r.carry_cents),
-    adjustments,
-  };
+  return { month, closedAt: String(r.closed_at), balanceCents: Number(r.balance_cents), adjustments };
 }
 
 /** Whether a date ("YYYY-MM-DD") falls in a closed budget month. */

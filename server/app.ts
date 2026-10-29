@@ -10,11 +10,13 @@ import { overview } from "./overview.ts";
 import { importWorkbook } from "./import-excel.ts";
 import { commitStatement, previewStatement, StatementError } from "./bank-import.ts";
 import { computeBabySteps } from "./baby-steps.ts";
-import { chargeSubscriptions, upcomingDebits } from "./subscriptions.ts";
+import { chargeDebits, upcomingDebits } from "./subscriptions.ts";
 import { transferPlan } from "./transfer-plan.ts";
 import { closeMonth, CloseError, reopenMonth } from "./month-close.ts";
+import { BackupError, type Backups } from "./backups.ts";
+import * as investments from "./investments.ts";
 import { monthStartOf, periodRange, todayISO } from "../shared/period.ts";
-import type { CloseAction, ExpenseGroup, Kind, PersonalLoanDirection, PlanSection } from "../shared/types.ts";
+import type { ExpenseGroup, InvestmentKind, Kind, PersonalLoanDirection, PlanSection } from "../shared/types.ts";
 
 class BadRequest extends Error {}
 // Something dated in a closed month would change: it has to be reopened first.
@@ -40,6 +42,14 @@ const monthStr = (v: unknown): string => {
   if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(s)) throw new BadRequest("invalid month");
   return s;
 };
+const num = (v: unknown, field: string, min = 0, max = 1e12): number => {
+  if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max) throw new BadRequest(`invalid ${field}`);
+  return v;
+};
+const investmentKind = (v: unknown): InvestmentKind => {
+  if (!["stock", "etf", "crypto", "fund", "other"].includes(v as string)) throw new BadRequest("invalid kind");
+  return v as InvestmentKind;
+};
 const kind = (v: unknown): Kind => {
   if (v !== "expense" && v !== "income") throw new BadRequest("invalid kind");
   return v;
@@ -57,10 +67,6 @@ const startMode = (v: unknown): "lastBusinessDay" | "fixedDay" => {
   if (v !== "lastBusinessDay" && v !== "fixedDay") throw new BadRequest("invalid monthStartMode");
   return v;
 };
-const closeAction = (v: unknown): CloseAction => {
-  if (v !== "carry" && v !== "pot" && v !== "none") throw new BadRequest("invalid action");
-  return v;
-};
 const expenseGroup = (v: unknown): ExpenseGroup => {
   if (v === "credit" || v === "fixed" || v === "variable") return v;
   throw new BadRequest("group must be credit, fixed or variable");
@@ -68,7 +74,11 @@ const expenseGroup = (v: unknown): ExpenseGroup => {
 const optId = (v: unknown) => (v == null ? undefined : int(v, "id", 1));
 const idParam = (req: Request) => int(Number(req.params.id), "id", 1);
 
-export function createApp(db: DB, opts: { password: string; secureCookie: boolean; staticDir?: string }) {
+export function createApp(
+  db: DB,
+  opts: { password: string; secureCookie: boolean; staticDir?: string; backups?: Backups },
+) {
+  const { backups } = opts;
   const app = express();
   const auth = createAuth(db, opts);
 
@@ -113,9 +123,9 @@ export function createApp(db: DB, opts: { password: string; secureCookie: boolea
 
   api.use(auth.requireAuth);
 
-  // Subscriptions whose debit day has come are added as expenses before anything is read.
+  // Subscriptions and loans whose debit day has come are added as expenses before anything is read.
   api.use((_req, _res, next) => {
-    chargeSubscriptions(db, todayISO());
+    chargeDebits(db, todayISO());
     next();
   });
 
@@ -196,6 +206,10 @@ export function createApp(db: DB, opts: { password: string; secureCookie: boolea
     const { from, to } = periodRange(monthStr(req.query.month), monthStartOf(store.getSettings(db)));
     res.json(upcomingDebits(db, from, to, todayISO()));
   });
+  // Categories last used per description, to pre-fill a new entry for the same shop.
+  api.get("/transactions/category-hints", (_req, res) => {
+    res.json(store.categoryHints(db));
+  });
   api.post("/transactions", (req, res) => {
     const b = req.body ?? {};
     // Unpaid expenses don't count in their month, so only paid ones are locked.
@@ -213,6 +227,24 @@ export function createApp(db: DB, opts: { password: string; secureCookie: boolea
         accountId: b.accountId == null ? null : accountId(b.accountId, "accountId"),
       }),
     );
+  });
+  // Anything dated ahead whose day has come, waiting for "did it go through?".
+  api.get("/to-confirm", (_req, res) => {
+    res.json(store.listToConfirm(db));
+  });
+  api.post("/to-confirm", (req, res) => {
+    const b = req.body ?? {};
+    const done = b.done === true;
+    const key = str(b.key, "key", 80);
+    if (b.type === "entry") {
+      ensureOpen(done && dateOf("transactions", int(Number(key), "key", 1))?.date);
+      if (!store.confirmTransaction(db, int(Number(key), "key", 1), done)) return res.status(404).json({ error: "not_found" });
+    } else if (b.type === "transfer" || b.type === "savings" || b.type === "loan" || b.type === "repayment") {
+      const { table, where, param } = store.confirmTarget(b.type, key);
+      if (done) ensureOpen(...datesOf(`SELECT date FROM ${table} WHERE ${where}`, param));
+      store.confirmScheduled(db, b.type, key, done);
+    } else throw new BadRequest("invalid type");
+    res.json({ ok: true });
   });
   api.post("/transactions/:id/pay", (req, res) => {
     ensureOpen(dateStr(req.body?.date));
@@ -397,7 +429,7 @@ export function createApp(db: DB, opts: { password: string; secureCookie: boolea
       accountId: b.accountId == null ? null : accountId(b.accountId, "accountId"),
     });
     // Setting today's day adds the expense straight away.
-    chargeSubscriptions(db, todayISO());
+    chargeDebits(db, todayISO());
     res.json({ id });
   });
   api.delete("/plan/items/:id", (req, res) => {
@@ -417,12 +449,24 @@ export function createApp(db: DB, opts: { password: string; secureCookie: boolea
       mortgage: Boolean(b.mortgage),
       sort: int(b.sort ?? 0, "sort"),
       accountId: b.accountId === undefined ? undefined : b.accountId == null ? null : accountId(b.accountId, "accountId"),
+      debitDay: b.debitDay === undefined ? undefined : b.debitDay == null ? null : int(b.debitDay, "debitDay", 1, 31),
       amortizations: b.amortizations.map((a: { year: unknown; amountCents: unknown }) => ({
         year: int(a.year, "year", 1900, 2200),
         amountCents: int(a.amountCents, "amountCents", 0),
       })),
     });
+    // Setting today's day adds the expense straight away.
+    chargeDebits(db, todayISO());
     res.json({ id });
+  });
+  // The day a loan's monthly payment is debited, added then as an expense; picked on the Plan.
+  api.put("/plan/loans/:id/debit-day", (req, res) => {
+    const id = idParam(req);
+    if (!store.listLoans(db).some((l) => l.id === id)) return res.status(404).json({ error: "not_found" });
+    const b = req.body ?? {};
+    store.setLoanDebitDay(db, id, b.debitDay == null ? null : int(b.debitDay, "debitDay", 1, 31));
+    chargeDebits(db, todayISO());
+    res.json({ ok: true });
   });
   // The account a loan's monthly payment leaves from, picked on the Plan.
   api.put("/plan/loans/:id/account", (req, res) => {
@@ -430,6 +474,14 @@ export function createApp(db: DB, opts: { password: string; secureCookie: boolea
     if (!store.listLoans(db).some((l) => l.id === id)) return res.status(404).json({ error: "not_found" });
     const b = req.body ?? {};
     store.setLoanAccount(db, id, b.accountId == null ? null : accountId(b.accountId, "accountId"));
+    res.json({ ok: true });
+  });
+  // The expense category a loan's monthly payment counts in on the Budget, picked on the Plan.
+  api.put("/plan/loans/:id/category", (req, res) => {
+    const id = idParam(req);
+    if (!store.listLoans(db).some((l) => l.id === id)) return res.status(404).json({ error: "not_found" });
+    const b = req.body ?? {};
+    store.setLoanCategory(db, id, b.categoryId == null ? null : expenseCategoryId(b.categoryId));
     res.json({ ok: true });
   });
   api.delete("/plan/loans/:id", (req, res) => {
@@ -510,7 +562,10 @@ export function createApp(db: DB, opts: { password: string; secureCookie: boolea
     res.json(result);
   });
   api.get("/loans/moves", (req, res) => {
-    const { from, to } = periodRange(monthStr(req.query.month), monthStartOf(store.getSettings(db)));
+    // Without a month: every move, for searching all months.
+    const { from, to } = req.query.month
+      ? periodRange(monthStr(req.query.month), monthStartOf(store.getSettings(db)))
+      : { from: "", to: "9999-12-31" };
     res.json(store.listLoanMoves(db, from, to));
   });
   api.delete("/loans/payment-batches/:batch", (req, res) => {
@@ -543,22 +598,20 @@ export function createApp(db: DB, opts: { password: string; secureCookie: boolea
     );
     res.json({ ok: true });
   });
-  // Closing a month: where its leftover goes, the bank balances, and the lock.
+  // Closing a month locks it and checks the account balances; no money moves between months.
   api.post("/month-close", (req, res) => {
     const b = req.body ?? {};
-    if (!Array.isArray(b.balances) || b.balances.length > 50) throw new BadRequest("invalid balances");
+    const balances = b.balances ?? [];
+    if (!Array.isArray(balances) || balances.length > 50) throw new BadRequest("invalid balances");
     res.json(
-      closeMonth(db, {
-        month: monthStr(b.month),
-        action: closeAction(b.action),
-        potId: b.potId == null ? null : int(b.potId, "potId", 1),
-        potCents: int(b.potCents ?? 0, "potCents", 0),
-        accountId: b.accountId == null ? null : accountId(b.accountId, "accountId"),
-        balances: b.balances.map((x: { accountId: unknown; bankCents: unknown }) => ({
+      closeMonth(
+        db,
+        monthStr(b.month),
+        balances.map((x: { accountId: unknown; bankCents: unknown }) => ({
           accountId: accountId(x.accountId, "accountId"),
           bankCents: int(x.bankCents, "bankCents"),
         })),
-      }),
+      ),
     );
   });
   api.delete("/month-close/:month", (req, res) => {
@@ -573,12 +626,56 @@ export function createApp(db: DB, opts: { password: string; secureCookie: boolea
     res.json(balanceReport(db));
   });
 
+  // Investments
+  api.get("/investments", (_req, res) => {
+    res.json(investments.portfolio(db));
+  });
+  api.post("/investments", (req, res) => {
+    const b = req.body ?? {};
+    const ticker = str(b.ticker, "ticker", 20).toUpperCase();
+    if (!ticker) throw new BadRequest("invalid ticker");
+    const id = investments.saveInvestment(db, {
+      id: optId(b.id),
+      ticker,
+      name: str(b.name ?? "", "name", 80),
+      kind: investmentKind(b.kind ?? "stock"),
+      quote: b.quote == null ? null : num(b.quote, "quote"),
+      quoteDate: b.quoteDate == null ? todayISO() : dateStr(b.quoteDate, "quoteDate"),
+    });
+    res.json({ id });
+  });
+  api.delete("/investments/:id", (req, res) => {
+    investments.deleteInvestment(db, idParam(req));
+    res.json({ ok: true });
+  });
+  api.post("/investments/trades", (req, res) => {
+    const b = req.body ?? {};
+    if (b.side !== "buy" && b.side !== "sell") throw new BadRequest("invalid side");
+    const quantity = num(b.quantity, "quantity");
+    if (quantity <= 0) throw new BadRequest("invalid quantity");
+    const id = investments.saveTrade(db, {
+      id: optId(b.id),
+      investmentId: int(b.investmentId, "investmentId", 1),
+      date: dateStr(b.date),
+      side: b.side,
+      quantity,
+      totalCents: int(b.totalCents, "totalCents", 0),
+      note: str(b.note ?? "", "note"),
+    });
+    res.json({ id });
+  });
+  api.delete("/investments/trades/:id", (req, res) => {
+    investments.deleteTrade(db, idParam(req));
+    res.json({ ok: true });
+  });
+
   // Import and backup
   api.post(
     "/import",
     express.raw({ type: "application/octet-stream", limit: "30mb" }),
     async (req: Request, res: Response) => {
       if (!Buffer.isBuffer(req.body) || req.body.length === 0) throw new BadRequest("empty file");
+      backups?.create("before-import");
       try {
         res.json(await importWorkbook(db, req.body));
       } catch (err) {
@@ -650,6 +747,29 @@ export function createApp(db: DB, opts: { password: string; secureCookie: boolea
     res.setHeader("Content-Disposition", `attachment; filename="budget-${stamp}.db"`);
     res.send(data);
   });
+  // Copies kept on the server (daily and before every import, wipe or restore).
+  api.get("/backups", (_req, res) => {
+    res.json({ enabled: !!backups, dir: backups?.dir ?? null, backups: backups?.list() ?? [] });
+  });
+  api.get("/backups/:name", (req, res) => {
+    if (!backups) throw new BackupError("not_found");
+    const file = backups.path(str(req.params.name, "name", 100));
+    res.setHeader("Content-Type", "application/vnd.sqlite3");
+    res.setHeader("Content-Disposition", `attachment; filename="${req.params.name}"`);
+    res.send(readFileSync(file));
+  });
+  api.post("/backups/:name/restore", (req, res) => {
+    if (!backups) throw new BackupError("not_found");
+    backups.restore(str(req.params.name, "name", 100));
+    res.json({ ok: true });
+  });
+  // Restores a copy downloaded earlier; what is there now is kept as a copy first.
+  api.post("/restore", express.raw({ type: "application/octet-stream", limit: "200mb" }), (req: Request, res: Response) => {
+    if (!backups) throw new BackupError("not_found");
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) throw new BadRequest("empty file");
+    backups.restoreUpload(req.body);
+    res.json({ ok: true });
+  });
 
   // Deletes all financial data; asks for the password again so a stray tap can't do it.
   api.post("/wipe", (req, res) => {
@@ -658,6 +778,7 @@ export function createApp(db: DB, opts: { password: string; secureCookie: boolea
       res.status(401).json({ error: "wrong_password" });
       return;
     }
+    backups?.create("before-wipe");
     store.wipeData(db);
     res.json({ ok: true });
   });
@@ -668,6 +789,14 @@ export function createApp(db: DB, opts: { password: string; secureCookie: boolea
   api.use((err: unknown, _req: Request, res: Response, _next: unknown) => {
     if (err instanceof MonthClosed) {
       res.status(409).json({ error: "month_closed" });
+      return;
+    }
+    if (err instanceof investments.InvestmentError) {
+      res.status(err.message === "not_found" ? 404 : 400).json({ error: err.message });
+      return;
+    }
+    if (err instanceof BackupError) {
+      res.status(err.message === "not_found" ? 404 : 400).json({ error: err.message });
       return;
     }
     if (err instanceof BadRequest || err instanceof CloseError) {

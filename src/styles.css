@@ -391,6 +391,13 @@ select {
 .btn.block {
   width: 100%;
 }
+.backup-row .list-main {
+  flex: 1;
+}
+.backup-kept {
+  margin: 16px 0 4px;
+  font-size: 0.95rem;
+}
 .small-btn {
   min-height: 34px;
   padding: 0 12px;
@@ -621,6 +628,25 @@ select {
   gap: 10px;
   flex-wrap: wrap;
 }
+.check-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+.check-inline input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+.search-total {
+  margin: 0;
+}
+.all-months {
+  min-height: 44px;
+}
 .filter-select {
   min-height: 44px;
   border-radius: 999px;
@@ -716,6 +742,10 @@ select {
 .plan-grid-table .budget-name {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.plan-grid-table .budget-account {
+  display: block;
+  font-size: 0.7rem;
 }
 .plan-grid-table th.selected {
   color: var(--text);
@@ -1448,43 +1478,101 @@ tr.clickable:hover td {
   background: var(--text);
 }
 
-.pot-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-  gap: 12px;
+/* What is free to spend, and how it is worked out */
+.hero-details summary {
+  cursor: pointer;
+  color: rgb(17 17 17 / 0.68);
 }
-.pot-ring {
-  display: grid;
-  grid-template-columns: 44px 1fr;
-  gap: 10px;
-  align-items: center;
-}
-.pot-ring > div {
+.sum-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
   display: flex;
   flex-direction: column;
-  min-width: 0;
+  gap: 4px;
 }
-.pot-ring strong {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.sum-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
 }
-.ring-track,
-.ring-fill {
-  fill: none;
-  stroke-width: 5;
-}
-.ring-track {
-  stroke: var(--surface-2);
-}
-.ring-fill {
-  stroke: var(--text);
-  stroke-linecap: round;
-}
-.ring-text {
-  fill: var(--text);
-  font-size: 9px;
+.sum-list .sum-total {
+  margin-top: 2px;
+  padding-top: 6px;
+  border-top: 1px solid rgb(17 17 17 / 0.2);
   font-weight: 600;
+}
+
+/* Wide screens: the overview's cards side by side, so charts keep a sensible size. */
+.overview-grid {
+  display: flex;
+  flex-direction: column;
+  gap: inherit;
+}
+@media (min-width: 1024px) {
+  .overview-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+}
+
+/* Things to do: each one links to where it is done */
+.todo .tip {
+  position: relative;
+  grid-template-columns: 8px 1fr 16px;
+  align-items: center;
+}
+.todo .tip-icon {
+  align-self: start;
+}
+/* The whole row is the link. */
+.todo-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+.todo-link {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  color: inherit;
+  text-decoration: none;
+}
+.todo-link strong {
+  font-weight: 500;
+}
+.todo .tip > svg {
+  color: var(--muted);
+}
+.pace-label {
+  margin-top: 6px;
+}
+.bars .small.neg {
+  display: block;
+  margin-top: 4px;
+}
+.bars .small.muted {
+  display: block;
+  margin-top: 4px;
+}
+.zero-line {
+  stroke: var(--muted);
+  stroke-width: 1;
+}
+.bar-neg {
+  fill: var(--neg);
+}
+.networth-value {
+  display: block;
+  font-size: 1.75rem;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+.card .list a.list-row {
+  color: inherit;
+  text-decoration: none;
 }
 
 /* Interactive spending chart */
@@ -1701,9 +1789,93 @@ a.btn {
   flex-direction: column;
   gap: 2px;
 }
-.segmented.wrap {
-  flex-wrap: wrap;
-}
 .closed-card p {
   margin: 0.25rem 0;
+}
+
+/* Budget: the "Uncategorised" row opens the entries that make it up. */
+.link-btn {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--accent-ink);
+  text-align: left;
+  cursor: pointer;
+}
+.uncategorised-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.uncategorised-entry {
+  padding: 10px 0;
+}
+.uncategorised-entry select {
+  width: 100%;
+  min-height: 44px;
+  margin-top: 6px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-size: 16px; /* stops iOS from zooming into fields */
+}
+
+/* Investments */
+
+.inv-amounts {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  white-space: nowrap;
+}
+.inv-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 16px;
+  margin: 0 0 12px;
+}
+.inv-facts dt {
+  color: var(--muted);
+}
+.inv-facts dd {
+  margin: 0;
+  text-align: right;
+}
+.inv-quote {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+.inv-quote .field {
+  flex: 1;
+  margin: 0;
+}
+.inv-quote .small-btn {
+  min-height: 44px;
+}
+
+/* Entries dated ahead whose day has come, waiting for "was it debited?". */
+.confirm-list {
+  list-style: none;
+  margin: 12px 0;
+  padding: 0;
+}
+.confirm-list li {
+  padding: 12px 0;
+}
+.confirm-list li + li {
+  border-top: 1px solid var(--border);
+}
+.confirm-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.confirm-row .list-main {
+  flex: 1;
+  min-width: 0;
 }

@@ -11,12 +11,14 @@ import Transactions from "./pages/Transactions";
 import Budget from "./pages/Budget";
 import YearPlan from "./pages/YearPlan";
 import Savings from "./pages/Savings";
+import Investments from "./pages/Investments";
 import Balance from "./pages/Balance";
 import Loans from "./pages/Loans";
 import Accounts from "./pages/Accounts";
 import BankImport from "./pages/BankImport";
 import Plan from "./pages/Plan";
 import SettingsPage from "./pages/Settings";
+import ConfirmScheduled from "./ConfirmScheduled";
 
 interface AppState {
   settings: Settings;
@@ -42,6 +44,7 @@ const NAV: { to: string; label: Key; icon: IconName; main: boolean }[] = [
   { to: "/budget", label: "navBudget", icon: "pie", main: true },
   { to: "/year", label: "navYearPlan", icon: "grid", main: false },
   { to: "/savings", label: "navSavings", icon: "target", main: true },
+  { to: "/investments", label: "navInvestments", icon: "trend", main: false },
   { to: "/accounts", label: "navAccounts", icon: "card", main: false },
   { to: "/balance", label: "navBalance", icon: "bars", main: false },
   { to: "/loans", label: "navLoans", icon: "swap", main: false },
@@ -57,6 +60,8 @@ export default function App() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [month, setMonth] = useState<string | null>(null);
   const [moreOpen, setMoreOpen] = useState(false);
+  // Bumped when entries change outside the open page, so it loads again.
+  const [version, setVersion] = useState(0);
   const { pathname } = useLocation();
   const inMore = NAV.some((n) => !n.main && pathname.startsWith(n.to));
 
@@ -114,12 +119,13 @@ export default function App() {
         </nav>
         {/* The year plan is a wide grid: let it use the whole screen. */}
         <main className={`content${pathname === "/year" ? " wide" : ""}`}>
-          <Routes>
+          <Routes key={version}>
             <Route path="/" element={<Dashboard />} />
             <Route path="/entries" element={<Transactions />} />
             <Route path="/budget" element={<Budget />} />
             <Route path="/year" element={<YearPlan />} />
             <Route path="/savings" element={<Savings />} />
+            <Route path="/investments" element={<Investments />} />
             <Route path="/accounts" element={<Accounts />} />
             <Route path="/accounts/import" element={<BankImport />} />
             <Route path="/balance" element={<Balance />} />
@@ -163,6 +169,12 @@ export default function App() {
           )}
         </nav>
       </div>
+      <ConfirmScheduled
+        onChanged={() => {
+          refresh().catch(() => {});
+          setVersion((v) => v + 1);
+        }}
+      />
     </AppContext.Provider>
   );
 }

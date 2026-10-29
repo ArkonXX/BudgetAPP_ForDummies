@@ -6,7 +6,8 @@
 import ExcelJS from "exceljs";
 import type { DB } from "./db.ts";
 import { tx } from "./db.ts";
-import { isClosedDate, payPerson, saveMovement, savePersonalLoan, saveTransaction, saveTransfer } from "./store.ts";
+import { categoryHints, isClosedDate, payPerson, saveMovement, savePersonalLoan, saveTransaction, saveTransfer } from "./store.ts";
+import { descriptionKey } from "../shared/describe.ts";
 import type { StatementPreview, StatementRow } from "../shared/types.ts";
 
 export class StatementError extends Error {}
@@ -255,11 +256,31 @@ export async function readStatement(data: Buffer): Promise<{ format: StatementPr
  * How the account's balance already moved on each day by each amount, from entries,
  * transfers, savings and personal loans (a repayment split across loans is one move).
  */
+// An expense the app added on a subscription's or loan's debit day.
+const AUTOMATIC = `(EXISTS (SELECT 1 FROM plan_charges c WHERE c.transaction_id = t.id)
+  OR EXISTS (SELECT 1 FROM loan_charges c WHERE c.transaction_id = t.id))`;
+// How far from its debit day the bank can date a direct debit.
+const DEBIT_DAYS = 5;
+
+/** Subscription and loan debits the app added to the account, which the bank may date a few days off. */
+function automaticDebits(db: DB, accountId: number): { date: string; cents: number; used: boolean }[] {
+  return (
+    db
+      .prepare(
+        `SELECT date, -amount_cents AS cents FROM transactions t
+          WHERE kind = 'expense' AND COALESCE(account_id, (SELECT id FROM accounts WHERE is_default = 1)) = ? AND ${AUTOMATIC}`,
+      )
+      .all(accountId) as { date: string; cents: number }[]
+  ).map((r) => ({ ...r, used: false }));
+}
+
+const daysApart = (a: string, b: string) => Math.abs(Date.parse(a) - Date.parse(b)) / 86400_000;
+
 function existingMoves(db: DB, accountId: number): Map<string, number> {
   const rows = db
     .prepare(
-      `SELECT date, CASE kind WHEN 'expense' THEN -amount_cents ELSE amount_cents END AS cents FROM transactions
-        WHERE COALESCE(account_id, (SELECT id FROM accounts WHERE is_default = 1)) = ?1
+      `SELECT date, CASE kind WHEN 'expense' THEN -amount_cents ELSE amount_cents END AS cents FROM transactions t
+        WHERE COALESCE(account_id, (SELECT id FROM accounts WHERE is_default = 1)) = ?1 AND NOT ${AUTOMATIC}
       UNION ALL SELECT date, -amount_cents FROM transfers WHERE from_account_id = ?1
       UNION ALL SELECT date, amount_cents FROM transfers WHERE to_account_id = ?1
       UNION ALL SELECT date, -amount_cents FROM savings_movements WHERE account_id = ?1 AND opening = 0
@@ -276,14 +297,6 @@ function existingMoves(db: DB, accountId: number): Map<string, number> {
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   return counts;
-}
-
-/** Category last used for the same description, so repeated shops come pre-filled. */
-function categoryGuesses(db: DB): Map<string, number> {
-  const rows = db
-    .prepare("SELECT kind, lower(description) AS d, category_id FROM transactions WHERE category_id IS NOT NULL AND description <> '' ORDER BY date, id")
-    .all() as { kind: string; d: string; category_id: number }[];
-  return new Map(rows.map((r) => [`${r.kind}|${r.d}`, Number(r.category_id)]));
 }
 
 /** "MB WAY  Inês" -> "mb way ines", so names match however the bank writes them. */
@@ -310,20 +323,39 @@ function personFinder(db: DB): (description: string) => string | null {
 export async function previewStatement(db: DB, accountId: number, data: Buffer): Promise<StatementPreview> {
   const { format, lines } = await readStatement(data);
   const moves = existingMoves(db, accountId);
-  const guesses = categoryGuesses(db);
+  const debits = automaticDebits(db, accountId);
+  // A line is an automatic debit if one is on the same day, or else within a few days.
+  const debitFor = (l: Line, exact: boolean) =>
+    debits
+      .filter((d) => !d.used && d.cents === l.amountCents && (exact ? d.date === l.date : daysApart(d.date, l.date) <= DEBIT_DAYS))
+      .sort((a, b) => daysApart(a.date, l.date) - daysApart(b.date, l.date))[0];
+  const guesses = new Map(categoryHints(db).map((h) => [`${h.kind}|${descriptionKey(h.description)}`, h.categoryId]));
   const findPerson = personFinder(db);
-  const rows = lines.map((l): StatementRow => {
-    // A line counts as already in the app when the account has a move on the same
-    // day for the same amount; each move matches one line only.
+  // A line counts as already in the app when the account has a move on the same
+  // day for the same amount; each move matches one line only.
+  const known = lines.map((l) => {
     const key = `${l.date}|${l.amountCents}`;
     const left = moves.get(key) ?? 0;
-    if (left > 0) moves.set(key, left - 1);
+    if (left > 0) {
+      moves.set(key, left - 1);
+      return true;
+    }
+    const d = debitFor(l, true);
+    if (d) d.used = true;
+    return d != null;
+  });
+  lines.forEach((l, i) => {
+    if (known[i]) return;
+    const d = debitFor(l, false);
+    if (d) d.used = known[i] = true;
+  });
+  const rows = lines.map((l, i): StatementRow => {
     const kind = l.amountCents < 0 ? "expense" : "income";
     return {
       ...l,
-      duplicate: left > 0,
+      duplicate: known[i],
       closed: isClosedDate(db, l.date),
-      categoryId: guesses.get(`${kind}|${l.description.toLowerCase()}`) ?? null,
+      categoryId: guesses.get(`${kind}|${descriptionKey(l.description)}`) ?? null,
       loanPerson: findPerson(l.description),
     };
   });

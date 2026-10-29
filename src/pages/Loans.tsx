@@ -3,7 +3,7 @@ import { api } from "../api";
 import { useApp } from "../App";
 import { useI18n } from "../i18n";
 import { dateLabel, money } from "../format";
-import { Loading, Modal, Money, MoneyField, Progress, Section, useLoad } from "../components";
+import { Loading, Modal, Money, MoneyField, Progress, ScheduledHint, ScheduledTag, Section, useLoad } from "../components";
 import { todayISO } from "../../shared/period";
 import TransactionForm, { AccountField } from "../TransactionForm";
 import type { InstallmentPlan, Loan, PersonalLoan, PersonalLoanDirection, PersonalLoanPayment } from "../../shared/types";
@@ -20,6 +20,7 @@ function LoanForm({ loan, onClose, onSaved }: { loan?: Loan; onClose: () => void
   const [monthly, setMonthly] = useState<number | null>(loan?.monthlyCents ?? 0);
   const [paidOff, setPaidOff] = useState(loan?.paidOff ?? false);
   const [mortgage, setMortgage] = useState(loan?.mortgage ?? false);
+  const [debitDay, setDebitDay] = useState<number | null>(loan?.debitDay ?? null);
   const [amort, setAmort] = useState(loan?.amortizations.map((a) => ({ ...a, key: `${a.year}` })) ?? []);
 
   const submit = async (e: FormEvent) => {
@@ -33,6 +34,7 @@ function LoanForm({ loan, onClose, onSaved }: { loan?: Loan; onClose: () => void
       mortgage,
       // The default account is stored as none, so it follows the main account if that changes.
       accountId: accountId === defaultAccount?.id ? null : accountId,
+      debitDay,
       sort: loan?.sort ?? 99,
       amortizations: amort.filter((a) => a.year > 1900).map(({ year, amountCents }) => ({ year, amountCents })),
     });
@@ -70,6 +72,18 @@ function LoanForm({ loan, onClose, onSaved }: { loan?: Loan; onClose: () => void
             </select>
           </label>
         )}
+        <label className="field">
+          <span>{t("debitDay")}</span>
+          <select value={debitDay ?? ""} onChange={(e) => setDebitDay(e.target.value ? Number(e.target.value) : null)}>
+            <option value="">{t("debitDayNone")}</option>
+            {Array.from({ length: 31 }, (_, i) => (
+              <option key={i + 1} value={i + 1}>
+                {i + 1}
+              </option>
+            ))}
+          </select>
+          <small className="muted">{t("loanDebitDayHint")}</small>
+        </label>
         <label className="check">
           <input type="checkbox" checked={paidOff} onChange={(e) => setPaidOff(e.target.checked)} />
           <span>{t("loanPaidOff")}</span>
@@ -182,6 +196,7 @@ function PersonalLoanForm({
           <span>{t("date")}</span>
           <input type="date" required value={date} onChange={(e) => setDate(e.target.value)} />
         </label>
+        <ScheduledHint date={date} />
         <label className="field">
           <span>{t("dueDate")}</span>
           <input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
@@ -254,6 +269,7 @@ function PaymentForm({
           <span>{t("date")}</span>
           <input type="date" required value={date} onChange={(e) => setDate(e.target.value)} />
         </label>
+        <ScheduledHint date={date} />
         <label className="field">
           <span>{t("note")}</span>
           <input maxLength={200} value={note} onChange={(e) => setNote(e.target.value)} />
@@ -376,6 +392,7 @@ function PersonPaymentForm({ group, onClose, onSaved }: { group: PersonGroup; on
           <span>{t("date")}</span>
           <input type="date" required value={date} onChange={(e) => setDate(e.target.value)} />
         </label>
+        <ScheduledHint date={date} />
         <label className="field">
           <span>{t("note")}</span>
           <input maxLength={200} value={note} onChange={(e) => setNote(e.target.value)} />
@@ -465,6 +482,7 @@ function PersonSheet({
                         ""
                       )}
                       {h.loan.outstandingCents > 0 && h.loan.dueDate && h.loan.dueDate < today && <span className="neg"> · {t("overdue")}</span>}
+                      {h.loan.scheduled && <ScheduledTag date={h.loan.date} />}
                     </span>
                   </div>
                   <Money cents={h.loan.direction === "lent" ? h.loan.amountCents : -h.loan.amountCents} signed />
@@ -483,6 +501,7 @@ function PersonSheet({
                       {dateLabel(h.date, lang)}
                       {h.note ? ` · ${h.note}` : ""}
                       {h.parts.length > 1 ? ` · ${t("coversLoans", { n: h.parts.length })}` : ""}
+                      {h.parts[0].scheduled && <ScheduledTag date={h.date} />}
                     </span>
                   </div>
                   <Money cents={h.loan.direction === "lent" ? -h.amountCents : h.amountCents} signed />
@@ -746,6 +765,7 @@ export default function Loans() {
                     </strong>
                     <span className="muted small">
                       {t("principal")}: {money(l.principalCents, lang)} · {t("monthlyPayment")}: {money(l.monthlyCents, lang)}
+                      {l.debitDay != null && !l.paidOff && ` · ${t("debitOn", { day: l.debitDay })}`}
                     </span>
                     {l.amortizations.length > 0 && (
                       <span className="muted small">

@@ -1,45 +1,37 @@
-// Closing a budget month, like turning the page on the spreadsheet: the
-// month's leftover goes on to the next month or into a savings pot (or a
-// shortfall is carried or covered from a pot), account balances are set to
-// what the bank shows, and the month's entries can no longer change.
-// Reopening undoes all of it.
+// Closing a budget month locks it: what it ended with is kept, and nothing
+// dated in it can change until it is reopened. No money moves between months:
+// the leftover is already in the accounts, whose balances go on by themselves.
+// Closing is also when the account balances are checked against the bank.
 import type { DB } from "./db.ts";
 import { tx } from "./db.ts";
-import { getClose, listAccounts, listPots, saveMovement } from "./store.ts";
+import { getClose, listAccounts } from "./store.ts";
 import { monthSummary } from "./reports.ts";
-import { addMonths, todayISO } from "../shared/period.ts";
-import type { CloseAction, MonthClose } from "../shared/types.ts";
+import { todayISO } from "../shared/period.ts";
+import type { MonthClose } from "../shared/types.ts";
 
 export class CloseError extends Error {}
 
-export interface CloseInput {
-  month: string;
-  action: CloseAction;
-  potId: number | null;
-  potCents: number; // how much of the leftover (or shortfall) the pot takes; the rest is carried
-  accountId: number | null; // the account the pot money leaves (or comes into); null = none
-  balances: { accountId: number; bankCents: number }[]; // what the bank shows now
-}
-
-/** The day before an exclusive end date. */
-function lastDay(to: string): string {
-  return new Date(Date.parse(to) - 86400_000).toISOString().slice(0, 10);
-}
-
-export function closeMonth(db: DB, input: CloseInput, today = todayISO()): MonthClose {
+/**
+ * Closes a month. `balances` is what the bank shows now for some accounts; a
+ * difference from the app is recorded as an adjustment, which changes the
+ * account's balance but not the budget.
+ */
+export function closeMonth(
+  db: DB,
+  month: string,
+  balances: { accountId: number; bankCents: number }[] = [],
+  today = todayISO(),
+): MonthClose {
   return tx(db, () => {
-    const summary = monthSummary(db, input.month, today);
+    const summary = monthSummary(db, month, today);
     if (!summary.canClose) throw new CloseError("cannot_close");
-    const balance = summary.balanceCents;
     db.prepare("INSERT INTO month_closes (month, closed_at, balance_cents, action) VALUES (?, ?, ?, 'none')").run(
-      input.month,
+      month,
       today,
-      balance,
+      summary.balanceCents,
     );
-
-    // Against the balances shown before closing, i.e. before any money goes to a pot.
     const accounts = listAccounts(db);
-    for (const b of input.balances) {
+    for (const b of balances) {
       const account = accounts.find((a) => a.id === b.accountId);
       if (!account) throw new CloseError("invalid accountId");
       const diff = b.bankCents - account.balanceCents;
@@ -48,49 +40,18 @@ export function closeMonth(db: DB, input: CloseInput, today = todayISO()): Month
           account.id,
           today,
           diff,
-          input.month,
+          month,
         );
     }
-
-    let action: CloseAction = input.action;
-    let potCents = 0;
-    let movementId: number | null = null;
-    let carry = action === "carry" ? balance : 0;
-    if (action === "pot" && balance === 0) action = "none";
-    if (action === "pot") {
-      const pot = listPots(db).find((p) => p.id === input.potId);
-      if (!pot) throw new CloseError("invalid potId");
-      potCents = input.potCents;
-      if (potCents < 1 || potCents > Math.abs(balance)) throw new CloseError("invalid potCents");
-      if (balance < 0 && potCents > pot.balanceCents) throw new CloseError("pot_too_small");
-      // On the month's last day, so a leftover saved counts as that month's savings.
-      movementId = saveMovement(db, {
-        potId: pot.id,
-        date: lastDay(summary.to),
-        amountCents: balance > 0 ? potCents : -potCents,
-        place: "",
-        note: `${balance > 0 ? "Sobra" : "Falta"} ${input.month}`,
-        opening: false,
-        accountId: input.accountId,
-      });
-      // What the pot doesn't take is carried on.
-      carry = balance > 0 ? balance - potCents : balance + potCents;
-    }
-    db.prepare(
-      "UPDATE month_closes SET action = ?, pot_id = ?, pot_cents = ?, movement_id = ?, carry_cents = ? WHERE month = ?",
-    ).run(action, action === "pot" ? input.potId : null, potCents, movementId, carry, input.month);
-    return getClose(db, input.month)!;
+    return getClose(db, month)!;
   });
 }
 
-/** Opens a closed month again; only the last closed one, as the next month counts on it. */
+/** Unlocks a closed month. Balance adjustments stay: they match what the bank showed (so does pot money from older closes). */
 export function reopenMonth(db: DB, month: string): void {
   if (!getClose(db, month)) throw new CloseError("not_closed");
-  if (getClose(db, addMonths(month, 1))) throw new CloseError("next_closed");
   tx(db, () => {
-    const row = db.prepare("SELECT movement_id FROM month_closes WHERE month = ?").get(month) as { movement_id: number | null };
-    if (row.movement_id != null) db.prepare("DELETE FROM savings_movements WHERE id = ?").run(row.movement_id);
-    // Its balance adjustments go with it (ON DELETE CASCADE).
+    db.prepare("UPDATE account_adjustments SET close_month = NULL WHERE close_month = ?").run(month);
     db.prepare("DELETE FROM month_closes WHERE month = ?").run(month);
   });
 }

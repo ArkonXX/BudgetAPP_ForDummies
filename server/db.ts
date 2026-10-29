@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { installmentDate } from "../shared/period.ts";
+import { installmentDate, todayISO } from "../shared/period.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS settings (
@@ -123,6 +123,15 @@ CREATE TABLE IF NOT EXISTS loans (
   sort INTEGER NOT NULL DEFAULT 0
 );
 
+-- Bank loan payments already added as an expense, one per loan and calendar
+-- month, so a deleted expense is not added again.
+CREATE TABLE IF NOT EXISTS loan_charges (
+  loan_id INTEGER NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
+  month TEXT NOT NULL, -- calendar month "YYYY-MM"
+  transaction_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL,
+  PRIMARY KEY (loan_id, month)
+);
+
 CREATE TABLE IF NOT EXISTS loan_amortizations (
   loan_id INTEGER NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
   year INTEGER NOT NULL,
@@ -148,8 +157,9 @@ CREATE TABLE IF NOT EXISTS personal_loan_payments (
   note TEXT NOT NULL DEFAULT ''
 );
 
--- A budget month that has been closed: what it ended with and where the
--- leftover (or shortfall) went. Entries dated in it can no longer change.
+-- A budget month that has been closed: entries dated in it can no longer
+-- change. action, pot_*, movement_id and carry_cents are only set on months
+-- closed by an earlier version, which also moved the leftover; they are ignored.
 CREATE TABLE IF NOT EXISTS month_closes (
   month TEXT PRIMARY KEY, -- budget month "YYYY-MM"
   closed_at TEXT NOT NULL,
@@ -161,13 +171,36 @@ CREATE TABLE IF NOT EXISTS month_closes (
   carry_cents INTEGER NOT NULL DEFAULT 0 -- added to (or taken from) the next month's balance
 );
 
--- A correction so an account's balance matches the bank; changes balances, not the budget.
+-- A correction so an account's balance matches the bank, made when closing a
+-- month; changes balances, not the budget.
 CREATE TABLE IF NOT EXISTS account_adjustments (
   id INTEGER PRIMARY KEY,
   account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   date TEXT NOT NULL,
   amount_cents INTEGER NOT NULL,
-  close_month TEXT REFERENCES month_closes(month) ON DELETE CASCADE -- made when closing that month
+  close_month TEXT REFERENCES month_closes(month) ON DELETE CASCADE -- the close it was made with; cleared on reopen
+);
+
+-- Stocks, ETFs, crypto… (the spreadsheet's Investimentos sheet). Prices in EUR per unit.
+CREATE TABLE IF NOT EXISTS investments (
+  id INTEGER PRIMARY KEY,
+  ticker TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT 'stock' CHECK (kind IN ('stock', 'etf', 'crypto', 'fund', 'other')),
+  quote REAL,
+  quote_date TEXT,
+  sort INTEGER NOT NULL DEFAULT 0
+);
+
+-- Buys and sells (the Transacoes sheet). total_cents is what was paid or received in EUR, fees included.
+CREATE TABLE IF NOT EXISTS investment_trades (
+  id INTEGER PRIMARY KEY,
+  investment_id INTEGER NOT NULL REFERENCES investments(id) ON DELETE CASCADE,
+  date TEXT NOT NULL,
+  side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
+  quantity REAL NOT NULL CHECK (quantity > 0),
+  total_cents INTEGER NOT NULL CHECK (total_cents >= 0),
+  note TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -194,6 +227,37 @@ export function guessExpenseGroup(name: string): "credit" | "fixed" | "variable"
   if (/subscri|comunica|bancari|mensa|seguro|renda|condomin|eletric|electric|agua|\bgas\b|\bluz\b|internet|telem|ajudas casa|propina|rent|insurance|utilit/.test(n))
     return "fixed";
   return "variable";
+}
+
+const plainName = (s: string) => s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+
+/**
+ * A first guess at the expense category each Plan line and bank loan counts
+ * in on the Budget, for those without one: a category with the same name, or
+ * else the one the spreadsheet's Sumário used for that kind of line
+ * (Subscrições, Investimentos, Doações, Créditos).
+ */
+export function tiePlanLines(db: DB): void {
+  const cats = (db.prepare("SELECT id, name, expense_group FROM categories WHERE kind = 'expense' AND archived = 0 ORDER BY sort, id").all() as {
+    id: number;
+    name: string;
+    expense_group: string;
+  }[]).map((c) => ({ id: Number(c.id), name: plainName(c.name), group: c.expense_group }));
+  const byName = (name: string) => cats.find((c) => c.name === plainName(name))?.id;
+  const byPattern = (re: RegExp, group?: string) => cats.find((c) => re.test(c.name) && (!group || c.group === group))?.id;
+  const SECTION: Record<string, RegExp> = { subscription: /subscri/, investment: /invest/, donation: /doac|donativ|donation/ };
+  const items = db.prepare("SELECT id, section, name FROM plan_items WHERE category_id IS NULL").all() as { id: number; section: string; name: string }[];
+  const setItem = db.prepare("UPDATE plan_items SET category_id = ? WHERE id = ?");
+  for (const i of items) {
+    const id = byName(i.name) ?? (SECTION[i.section] ? byPattern(SECTION[i.section]) : undefined);
+    if (id != null) setItem.run(id, i.id);
+  }
+  const loans = db.prepare("SELECT id, name FROM loans WHERE category_id IS NULL").all() as { id: number; name: string }[];
+  const setLoan = db.prepare("UPDATE loans SET category_id = ? WHERE id = ?");
+  for (const l of loans) {
+    const id = byName(l.name) ?? byPattern(/credito|financ|finac|emprestimo|loan/, "credit");
+    if (id != null) setLoan.run(id, l.id);
+  }
 }
 
 // Columns added after the first release; CREATE TABLE IF NOT EXISTS skips existing tables.
@@ -257,6 +321,29 @@ function migrate(db: DB) {
   // The account a day-to-day category's money goes to on payday; NULL = it stays in the salary account.
   if (!cols("categories").includes("account_id"))
     db.exec("ALTER TABLE categories ADD COLUMN account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL");
+  // The expense category a bank loan's monthly payment counts in on the Budget; NULL = its own line.
+  if (!cols("loans").includes("category_id")) {
+    db.exec("ALTER TABLE loans ADD COLUMN category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL");
+    tiePlanLines(db);
+  }
+  // Bank loans: the day of the month the payment is debited, added as an expense on that day.
+  if (!cols("loans").includes("debit_day")) {
+    db.exec("ALTER TABLE loans ADD COLUMN debit_day INTEGER");
+    db.exec("ALTER TABLE loans ADD COLUMN charge_from TEXT");
+  }
+  // An entry dated after today doesn't count until that day comes and it is
+  // confirmed as debited (or received); until then it is kept unpaid.
+  if (!cols("transactions").includes("scheduled")) {
+    db.exec("ALTER TABLE transactions ADD COLUMN scheduled INTEGER NOT NULL DEFAULT 0");
+    db.prepare("UPDATE transactions SET scheduled = 1, paid = 0 WHERE paid = 1 AND plan_id IS NULL AND date > ?").run(todayISO());
+  }
+  // The same for transfers, savings movements and money lent, borrowed or paid back to people.
+  for (const table of ["transfers", "savings_movements", "personal_loans", "personal_loan_payments"])
+    if (!cols(table).includes("scheduled")) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN scheduled INTEGER NOT NULL DEFAULT 0`);
+      const opening = table === "savings_movements" ? " AND opening = 0" : "";
+      db.prepare(`UPDATE ${table} SET scheduled = 1 WHERE date > ?${opening}`).run(todayISO());
+    }
   restoreInstallments(db);
   const hasDefault = db.prepare("SELECT 1 FROM accounts WHERE is_default = 1").get();
   if (!hasDefault) {

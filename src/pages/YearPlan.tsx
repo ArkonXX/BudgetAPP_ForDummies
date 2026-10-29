@@ -40,7 +40,7 @@ function PlanGridTable({
     return Math.max(c.plannedCents, c.actualCents + c.toPayCents);
   };
   const editable = (r: PlanRow) => r.kind === "savings" || (r.categoryId != null && r.kind !== "repaid");
-  const shown = (r: PlanRow) => (editing ? editable(r) : grid.months.some((_, i) => counted(r, i)));
+  const shown = (r: PlanRow) => (editing ? editable(r) || r.planLine : grid.months.some((_, i) => counted(r, i)));
   const blocks = [
     { key: "income", label: t("incomes"), all: grid.rows.filter((r) => r.kind === "income") },
     ...EXPENSE_GROUPS.map((g) => ({
@@ -99,8 +99,9 @@ function PlanGridTable({
             </tr>
             {b.rows.map((r) => (
               <tr key={r.key}>
-                <td className="sticky">
+                <td className="sticky" title={r.fromPlan.join(", ") || undefined}>
                   <span className="budget-name">{name(r)}</span>
+                  {r.planLine && <span className="budget-account muted">{t("fromPlan")}</span>}
                 </td>
                 {r.cells.map((c, i) => {
                   const m = grid.months[i];

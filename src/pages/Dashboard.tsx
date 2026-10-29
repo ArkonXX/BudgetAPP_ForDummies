@@ -3,198 +3,295 @@ import { Link } from "react-router-dom";
 import { api } from "../api";
 import { useApp } from "../App";
 import { Icon } from "../icons";
-import { useI18n, type Key } from "../i18n";
+import { useI18n, type Key, type Lang } from "../i18n";
 import { dateLabel, money, monthLabel } from "../format";
-import { Loading, Money, MonthNav, Progress, Section, useLoad } from "../components";
+import { Loading, Money, MonthNav, Section, useLoad } from "../components";
 import TransactionForm from "../TransactionForm";
 import SpendingChart, { axisLabel, niceScale } from "../SpendingChart";
-import type { Account, Overview, SavingsPot, SummaryLine, Tip } from "../../shared/types";
+import type { Account, Overview, SummaryLine, Todo, TodoType } from "../../shared/types";
 
-function TipItem({ tip }: { tip: Tip }) {
+/** "outubro" / "October": a month's name the way it reads in a sentence. */
+function nameOf(month: string, lang: Lang): string {
+  const name = monthLabel(month, lang).split(" ")[0];
+  return lang === "pt" ? name.toLowerCase() : name;
+}
+
+/** The big number on top: what is free to spend, or what a past or future month leaves over. */
+function Hero({ data }: { data: Overview }) {
   const { t, lang } = useI18n();
   const m = (c: number) => money(c, lang);
-  const key = tip.type.charAt(0).toUpperCase() + tip.type.slice(1);
-  const vars = {
-    name: tip.name,
-    actual: m(tip.amountCents),
-    amount: m(tip.amountCents),
-    planned: m(tip.compareCents),
-    usual: m(tip.compareCents),
-    diff: m(tip.amountCents - tip.compareCents),
-  };
-  const icon = { bad: "!", warn: "↗", info: "i", good: "✓" }[tip.level];
-  return (
-    <li className={`tip ${tip.level}`}>
-      <span className="tip-icon" aria-hidden="true">
-        {icon}
-      </span>
-      <div>
-        <strong>{t(`tip${key}Title` as Key, vars)}</strong>
-        <span className="muted small">{t(`tip${key}` as Key, vars)}</span>
+  const s = data.summary;
+  const a = data.available;
+  const lastDay = new Date(`${s.to}T00:00:00Z`);
+  lastDay.setUTCDate(lastDay.getUTCDate() - 1);
+
+  if (a) {
+    const rows: [Key, number][] = [
+      ["freeInAccounts", a.accountsCents],
+      ["freeToPay", -a.toPayCents],
+      ["freeFixed", -a.fixedLeftCents],
+      ["freeSavings", -a.savingsLeftCents],
+    ];
+    return (
+      <div className="hero card accent">
+        <span className="muted">
+          {t("freeToSpend", {
+            date: new Intl.DateTimeFormat(lang === "pt" ? "pt-PT" : "en-GB", { day: "numeric", month: "long", timeZone: "UTC" }).format(lastDay),
+          })}
+        </span>
+        <div className={`hero-value ${a.freeCents < 0 ? "neg" : "pos"}`}>{m(a.freeCents)}</div>
+        <span className="muted small">
+          {a.freeCents < 0
+            ? t("noMoneyFree")
+            : a.daysLeft > 1
+              ? t("perDay", { amount: m(Math.floor(a.freeCents / a.daysLeft)), days: a.daysLeft })
+              : t("perDayOne")}
+        </span>
+        {a.dayToDayLeftCents > 0 && (
+          <span className="small">
+            {a.dayToDayLeftCents > a.freeCents && a.freeCents >= 0
+              ? t("dayToDayShort", { amount: m(a.dayToDayLeftCents), free: m(a.freeCents) })
+              : t("dayToDayLeft", { amount: m(a.dayToDayLeftCents) })}
+          </span>
+        )}
+        <details className="hero-details">
+          <summary className="small">{t("howWorkedOut")}</summary>
+          <ul className="sum-list small">
+            {rows
+              .filter(([, v], i) => i === 0 || v !== 0)
+              .map(([k, v]) => (
+                <li key={k}>
+                  <span>{t(k)}</span>
+                  <span className="num">{m(v)}</span>
+                </li>
+              ))}
+            <li className="sum-total">
+              <span>{t("freeResult")}</span>
+              <span className="num">{m(a.freeCents)}</span>
+            </li>
+          </ul>
+        </details>
       </div>
+    );
+  }
+
+  const future = data.elapsedDays === 0;
+  const result = future ? s.plannedIncomeCents - s.plannedExpenseCents - s.plannedSavingsCents : s.balanceCents;
+  const figures = future
+    ? { income: m(s.plannedIncomeCents), expense: m(s.plannedExpenseCents), saved: m(s.plannedSavingsCents) }
+    : { income: m(s.totalIncomeCents), expense: m(s.totalExpenseCents + s.repaidCents), saved: m(s.savingsCents) };
+  return (
+    <div className="hero card accent">
+      <span className="muted">
+        {future ? t("plannedLeft") : t(result < 0 ? "shortInMonth" : "leftInMonth", { month: nameOf(s.month, lang) })}
+      </span>
+      <div className={`hero-value ${result < 0 ? "neg" : "pos"}`}>{m(result)}</div>
+      <span className="muted small">{t("monthFigures", figures)}</span>
+    </div>
+  );
+}
+
+const TODO_LINKS: Record<TodoType, string> = {
+  closeMonth: "/budget",
+  uncategorised: "/budget?uncategorised=1",
+  pending: "/budget",
+  debitsSoon: "/budget",
+  shortAccount: "/accounts",
+  savingsBehind: "/savings",
+  annualNext: "/plan",
+};
+
+function TodoItem({ item }: { item: Todo }) {
+  const { t, lang } = useI18n();
+  const m = (c: number) => money(c, lang);
+  const vars = {
+    name: item.type === "closeMonth" ? nameOf(item.name, lang) : item.name,
+    month: item.type === "closeMonth" ? nameOf(item.name, lang) : "",
+    count: item.count,
+    amount: m(item.amountCents),
+    actual: m(item.amountCents),
+    planned: m(item.compareCents),
+  };
+  const [title, text]: [Key, Key] = {
+    closeMonth: ["todoCloseMonthTitle", "todoCloseMonth"],
+    uncategorised: [item.count === 1 ? "todoUncategorisedOneTitle" : "todoUncategorisedTitle", "todoUncategorised"],
+    pending: [item.level === "bad" ? "todoPendingLateTitle" : "todoPendingTitle", "todoPending"],
+    debitsSoon: item.count === 1 ? ["todoDebitsSoonOneTitle", "todoDebitsSoonOne"] : ["todoDebitsSoonTitle", "todoDebitsSoon"],
+    shortAccount: ["todoShortAccountTitle", "todoShortAccount"],
+    savingsBehind: ["tipSavingsBehindTitle", "tipSavingsBehind"],
+    annualNext: ["tipAnnualNextTitle", "tipAnnualNext"],
+  }[item.type] as [Key, Key];
+  return (
+    <li className={`tip ${item.level}`}>
+      <span className="tip-icon" aria-hidden="true" />
+      <Link to={TODO_LINKS[item.type]} className="todo-link">
+        <strong>{t(title, vars)}</strong>
+        <span className="muted small">{t(text, vars)}</span>
+      </Link>
+      <Icon name="right" size={16} />
     </li>
   );
 }
 
-/** Actual against planned for every expense category in use. */
-function CategoryBars({ lines }: { lines: SummaryLine[] }) {
-  const { t } = useI18n();
-  const shown = lines
-    .filter((l) => l.actualCents > 0 || l.plannedCents > 0)
-    .sort((a, b) => b.actualCents - a.actualCents || b.plannedCents - a.plannedCents);
-  if (shown.length === 0) return <p className="muted">{t("nothingYet")}</p>;
-  const max = Math.max(...shown.map((l) => Math.max(l.actualCents, l.plannedCents)));
+type Watch = { line: SummaryLine; note: string; over: boolean; score: number };
+
+/** The few categories that are over, close to their budget, unplanned or above the usual. */
+function watchList(data: Overview, t: ReturnType<typeof useI18n>["t"], m: (c: number) => string): Watch[] {
+  const usual = new Map(data.tips.filter((x) => x.type === "aboveUsual").map((x) => [x.name, x.compareCents]));
+  const out: Watch[] = [];
+  for (const l of data.summary.expenses) {
+    if (l.categoryId == null) continue;
+    const { plannedCents: planned, actualCents: actual, toPayCents: toPay } = l;
+    if (planned > 0 && actual > planned)
+      out.push({ line: l, over: true, score: 2 + (actual - planned) / planned, note: t("watchOver", { diff: m(actual - planned) }) });
+    else if (planned > 0 && actual + toPay >= planned * 0.9) {
+      const beyond = actual + toPay - planned;
+      const note =
+        beyond > 0
+          ? t("watchToPayOver", { toPay: m(toPay), diff: m(beyond) })
+          : toPay
+            ? t("watchNearToPay", { toPay: m(toPay), left: m(-beyond) })
+            : t("watchNear", { left: m(-beyond) });
+      out.push({ line: l, over: beyond > 0, score: (actual + toPay) / planned, note });
+    } else if (planned === 0 && actual >= 1000) out.push({ line: l, over: true, score: 1.5, note: t("watchUnplanned") });
+    else if (usual.has(l.name)) out.push({ line: l, over: false, score: 0.5, note: t("watchAboveUsual", { usual: m(usual.get(l.name)!) }) });
+  }
+  return out.sort((a, b) => b.score - a.score);
+}
+
+function CategoryWatch({ data }: { data: Overview }) {
+  const { t, lang } = useI18n();
+  const m = (c: number) => money(c, lang);
+  const all = watchList(data, t, m);
+  const shown = all.slice(0, 3);
+  if (shown.length === 0) return <p className="muted">{t("allCategoriesFine")}</p>;
   return (
-    <>
-      <ul className="bars">
-        {shown.map((l) => {
-          const over = l.actualCents > l.plannedCents;
-          return (
-            <li key={l.categoryId ?? "none"}>
-              <div className="bar-label small">
-                <span>{l.name || t("uncategorised")}</span>
-                <span>
-                  <Money cents={l.actualCents} />
-                  {l.plannedCents > 0 && (
-                    <span className="muted">
-                      {" / "}
-                      <Money cents={l.plannedCents} />
-                    </span>
-                  )}
-                </span>
-              </div>
-              <div className="bar-track plan-track">
-                <div className={`bar-fill ${over ? "over" : ""}`} style={{ width: `${(l.actualCents / max) * 100}%` }} />
+    <ul className="bars">
+      {shown.map(({ line: l, note, over }) => {
+        const max = Math.max(l.actualCents + l.toPayCents, l.plannedCents, 1);
+        return (
+          <li key={l.categoryId}>
+            <div className="bar-label small">
+              <span>{l.name}</span>
+              <span>
+                <Money cents={l.actualCents} />
                 {l.plannedCents > 0 && (
-                  <div className="plan-mark" style={{ left: `calc(${(l.plannedCents / max) * 100}% - 1px)` }} />
+                  <span className="muted">
+                    {" / "}
+                    <Money cents={l.plannedCents} />
+                  </span>
                 )}
-              </div>
-            </li>
-          );
-        })}
-      </ul>
-      <div className="legend small">
-        <span>
-          <i className="dot income" /> {t("withinBudget")}
-        </span>
-        <span>
-          <i className="dot over" /> {t("overBudget")}
-        </span>
-        <span>
-          <i className="mark" /> {t("planned")}
-        </span>
-      </div>
-    </>
+              </span>
+            </div>
+            <div className="bar-track plan-track">
+              <div className={`bar-fill ${over ? "over" : ""}`} style={{ width: `${(l.actualCents / max) * 100}%` }} />
+              {l.plannedCents > 0 && <div className="plan-mark" style={{ left: `calc(${(l.plannedCents / max) * 100}% - 1px)` }} />}
+            </div>
+            <span className={`small ${over ? "neg" : "muted"}`}>{note}</span>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
-/** Income against expenses plus savings, with each month's result on top. */
-function MonthsChart({ history }: { history: Overview["history"] }) {
+/** What each month left over once expenses and savings were paid, above or below zero. */
+function LeftChart({ history }: { history: Overview["history"] }) {
   const { t, lang } = useI18n();
-  const W = 340, H = 190, L = 40, R = 4, T = 18, B = 22;
-  const { top, step } = niceScale(Math.max(...history.map((h) => Math.max(h.incomeCents, h.expenseCents + h.savingsCents))));
-  const y = (v: number) => T + (1 - v / top) * (H - T - B);
+  const W = 340, H = 170, L = 40, R = 4, T = 16, B = 22;
+  const nets = history.map((h) => h.incomeCents - h.expenseCents - h.savingsCents);
+  const hi = Math.max(0, ...nets);
+  const lo = Math.min(0, ...nets);
+  const { top, step } = niceScale(Math.max(hi, -lo, 1));
+  const bottom = lo < 0 ? -Math.ceil(-lo / step) * step : 0;
+  const ceil = hi > 0 || lo === 0 ? top : 0;
+  const y = (v: number) => T + ((ceil - v) / (ceil - bottom || 1)) * (H - T - B);
   const slot = (W - L - R) / history.length;
-  const bw = slot * 0.3;
-  const ticks = Array.from({ length: Math.round(top / step) + 1 }, (_, i) => i * step);
-  const bar = (x: number, v: number, cls: string) => {
-    const h = Math.max(0, y(0) - y(v));
-    const r = Math.min(4, h, bw / 2);
-    return (
-      <path
-        className={cls}
-        d={`M${x} ${y(0)} V${y(0) - h + r} q0 ${-r} ${r} ${-r} h${bw - 2 * r} q${r} 0 ${r} ${r} V${y(0)} Z`}
-      />
-    );
-  };
+  const bw = slot * 0.5;
+  const ticks: number[] = [];
+  for (let v = bottom; v <= ceil; v += step) ticks.push(v);
 
   return (
     <figure className="chart">
-      <svg viewBox={`0 0 ${W} ${H}`} className="chart-svg" role="img" aria-label={t("lastMonths")}>
+      <svg viewBox={`0 0 ${W} ${H}`} className="chart-svg" role="img" aria-label={t("leftPerMonth")}>
         {ticks.map((v) => (
           <g key={v}>
-            <line x1={L} x2={W - R} y1={y(v)} y2={y(v)} className="grid-line" />
+            <line x1={L} x2={W - R} y1={y(v)} y2={y(v)} className={v === 0 ? "zero-line" : "grid-line"} />
             <text x={L - 6} y={y(v) + 3} textAnchor="end" className="axis-text">
-              {axisLabel(v)}
+              {v < 0 ? `-${axisLabel(-v)}` : axisLabel(v)}
             </text>
           </g>
         ))}
         {history.map((h, i) => {
-          const x0 = L + i * slot + slot * 0.18;
-          const out = h.expenseCents + h.savingsCents;
-          const net = h.incomeCents - out;
-          const empty = !h.incomeCents && !out;
+          const net = nets[i];
+          const x = L + i * slot + (slot - bw) / 2;
+          const empty = !h.incomeCents && !h.expenseCents && !h.savingsCents;
+          const y0 = y(0), y1 = y(net);
           const label = monthLabel(h.month, lang, true).replace(/\s?\d{4}$/, "");
           return (
             <g key={h.month}>
-              {bar(x0, h.incomeCents, "bar-income")}
-              {bar(x0 + bw + 2, out, "bar-expense")}
               {!empty && (
-                <text
-                  x={x0 + bw + 1}
-                  y={y(Math.max(h.incomeCents, out)) - 5}
-                  textAnchor="middle"
-                  className={`axis-text strong ${net < 0 ? "neg-text" : ""}`}
-                >
+                <rect x={x} width={bw} y={Math.min(y0, y1)} height={Math.max(1, Math.abs(y1 - y0))} rx={3} className={net < 0 ? "bar-neg" : "bar-income"} />
+              )}
+              {!empty && (
+                <text x={x + bw / 2} y={net < 0 ? y1 + 12 : y1 - 5} textAnchor="middle" className={`axis-text strong ${net < 0 ? "neg-text" : ""}`}>
                   {net > 0 ? "+" : ""}
                   {Math.round(net / 100)}
                 </text>
               )}
-              <text x={x0 + bw + 1} y={H - 6} textAnchor="middle" className={`axis-text ${i === history.length - 1 ? "strong" : ""}`}>
+              <text x={x + bw / 2} y={H - 6} textAnchor="middle" className={`axis-text ${i === history.length - 1 ? "strong" : ""}`}>
                 {label}
               </text>
               <rect x={L + i * slot} y={T} width={slot} height={H - T - B} className="hit">
                 <title>
-                  {monthLabel(h.month, lang)}: {t("incomes")} {money(h.incomeCents, lang)}, {t("expensesAndSavings")}{" "}
-                  {money(out, lang)}, {t("balance")} {money(net, lang)}
+                  {monthLabel(h.month, lang)}: {t("incomes")} {money(h.incomeCents, lang)}, {t("expenses")} {money(h.expenseCents, lang)},{" "}
+                  {t("navSavings")} {money(h.savingsCents, lang)} = {money(net, lang)}
                 </title>
               </rect>
             </g>
           );
         })}
       </svg>
-      <figcaption className="legend small">
-        <span>
-          <i className="dot income" /> {t("incomes")}
-        </span>
-        <span>
-          <i className="dot expense" /> {t("expensesAndSavings")}
-        </span>
-      </figcaption>
+      <figcaption className="muted small">{t("leftAfterSaving")}</figcaption>
     </figure>
   );
 }
 
-function PotRing({ pot }: { pot: SavingsPot }) {
-  const { t } = useI18n();
-  const pct = pot.goalCents > 0 ? Math.max(0, Math.min(1, pot.balanceCents / pot.goalCents)) : 0;
-  const C = 2 * Math.PI * 17;
+function NetWorthCard({ data }: { data: Overview & { accounts: Account[] } }) {
+  const { t, lang } = useI18n();
+  const n = data.netWorth;
+  const accounts = data.accounts.filter((a) => !a.archived || a.balanceCents !== 0);
+  const rows: { key: Key; cents: number; to: string }[] = [
+    { key: "potsTotal", cents: n.potsCents, to: "/savings" },
+    { key: "owedToMeTotal", cents: n.owedToMeCents, to: "/loans" },
+    { key: "iOweTotal", cents: -n.iOweCents, to: "/loans" },
+    { key: "installmentsTotal", cents: -n.installmentsLeftCents, to: "/loans" },
+  ];
   return (
-    <div className="pot-ring">
-      <svg viewBox="0 0 44 44" width="44" height="44" aria-hidden="true">
-        <circle cx="22" cy="22" r="17" className="ring-track" />
-        {pct > 0 && (
-          <circle cx="22" cy="22" r="17" className="ring-fill" strokeDasharray={`${pct * C} ${C}`} transform="rotate(-90 22 22)" />
-        )}
-        <text x="22" y="25.5" textAnchor="middle" className="ring-text">
-          {pot.goalCents > 0 ? `${Math.round(pct * 100)}%` : "–"}
-        </text>
-      </svg>
-      <div>
-        <strong>{pot.name}</strong>
-        <span className="muted small">
-          <Money cents={pot.balanceCents} />
-          {pot.goalCents > 0 ? (
-            <>
-              {" / "}
-              <Money cents={pot.goalCents} />
-            </>
-          ) : (
-            ` · ${t("noGoal")}`
-          )}
-        </span>
-      </div>
-    </div>
+    <Section title={t("netWorth")}>
+      <strong className={`networth-value num ${n.totalCents < 0 ? "neg" : ""}`}>{money(n.totalCents, lang)}</strong>
+      <ul className="list">
+        {accounts.map((a) => (
+          <li key={a.id}>
+            <Link to="/accounts" className="list-row">
+              <span>{accounts.length > 1 ? a.name : t("totalAccounts")}</span>
+              <Money cents={a.balanceCents} signed={a.balanceCents < 0} />
+            </Link>
+          </li>
+        ))}
+        {rows
+          .filter((r) => r.cents !== 0 || r.key === "potsTotal")
+          .map((r) => (
+            <li key={r.key}>
+              <Link to={r.to} className="list-row">
+                <span>{t(r.key)}</span>
+                <Money cents={r.cents} signed={r.cents < 0} />
+              </Link>
+            </li>
+          ))}
+      </ul>
+      <p className="muted small">{t("netWorthHelp")}</p>
+    </Section>
   );
 }
 
@@ -235,163 +332,62 @@ export default function Dashboard() {
         {t("period", { from: dateLabel(s.from, lang), to: dateLabel(end.toISOString().slice(0, 10), lang) })}
       </p>
 
-      <div className="hero card accent">
-        <div className="card-head">
-          <span className="muted">{t("monthBalance")}</span>
-          {inProgress && <span className="muted small">{t("dayOfMonth", { day: data.elapsedDays, days: data.days })}</span>}
-        </div>
-        <div className={`hero-value ${s.balanceCents < 0 ? "neg" : "pos"}`}>{money(s.balanceCents, lang)}</div>
-        {s.pendingCents > 0 && (
-          <Link to="/budget" className="muted small">
-            {t("afterPending")}: {money(s.balanceCents - s.pendingCents, lang)}
-          </Link>
-        )}
-        {s.plannedExpenseCents > 0 && (
-          <>
-            <div className="pace" role="presentation">
-              <div className={`pace-fill ${spentPct > 100 ? "over" : ""}`} style={{ width: `${Math.min(100, spentPct)}%` }} />
-              {inProgress && <div className="pace-today" style={{ left: `${elapsedPct}%` }} />}
-            </div>
-            <div className="bar-label small">
-              <span>
-                {t("spentPace", {
-                  spent: money(s.totalExpenseCents, lang),
-                  planned: money(s.plannedExpenseCents, lang),
-                  pct: spentPct,
-                })}
-              </span>
-              {inProgress && <span className="muted">{t("monthElapsed", { pct: elapsedPct })}</span>}
-            </div>
-          </>
-        )}
-        {projected != null && (
-          <p className="muted small projection">
-            {projectedOver > 0
-              ? t("projectionOver", { amount: money(projected, lang), over: money(projectedOver, lang) })
-              : t("projection", { amount: money(projected, lang) })}
-          </p>
-        )}
-      </div>
+      <Hero data={data} />
 
-      <div className="tiles">
-        <div className="card tile">
-          <span className="muted">{t("incomes")}</span>
-          <strong className="num">{money(s.totalIncomeCents, lang)}</strong>
-          <Progress actual={s.totalIncomeCents} planned={s.plannedIncomeCents} inverse />
-          <span className="muted small">{t("receivedOfPlanned", { planned: money(s.plannedIncomeCents, lang) })}</span>
-        </div>
-        <div className="card tile">
-          <span className="muted">{t("expenses")}</span>
-          <strong className="num">{money(s.totalExpenseCents, lang)}</strong>
-          <Progress actual={s.totalExpenseCents} planned={s.plannedExpenseCents} />
-          <span className="muted small">{t("spentOfPlanned", { planned: money(s.plannedExpenseCents, lang) })}</span>
-        </div>
-        <div className="card tile">
-          <span className="muted">{t("savedThisMonth")}</span>
-          <strong className="num">{money(s.savingsCents, lang)}</strong>
-          <Progress actual={s.savingsCents} planned={s.plannedSavingsCents} inverse />
-          <span className="muted small">
-            {t("totalSavings")}: {money(s.savingsTotalCents, lang)}
-          </span>
-        </div>
-      </div>
-
-      {(data.debts.people.length > 0 || data.debts.installmentsLeftCents > 0) && (
-        <Section title={t("debtsTitle")} action={<Link to="/loans" className="link">{t("navLoans")} →</Link>}>
-          <div className="person-balance">
-            {data.debts.iOweCents > 0 && (
-              <div>
-                <span className="muted small">{t("iOwe")}</span>
-                <strong className="num neg">{money(data.debts.iOweCents, lang)}</strong>
-              </div>
-            )}
-            {data.debts.owedToMeCents > 0 && (
-              <div>
-                <span className="muted small">{t("owedToMe")}</span>
-                <strong className="num pos">{money(data.debts.owedToMeCents, lang)}</strong>
-              </div>
-            )}
-          </div>
-          <ul className="list">
-            {data.debts.people.map((p) => (
-              <li key={p.person} className="list-row static">
-                <span>
-                  {p.person} <span className="muted small">· {p.netCents < 0 ? t("iOwe") : t("owedToMe")}</span>
-                </span>
-                <Money cents={p.netCents} signed />
-              </li>
-            ))}
-            {data.debts.installmentsLeftCents > 0 && (
-              <li className="list-row static">
-                <span>{t("installmentPurchases")}</span>
-                <Money cents={-data.debts.installmentsLeftCents} signed />
-              </li>
-            )}
-          </ul>
-        </Section>
-      )}
-
-      {data.accounts.length > 1 && (
-        <Section title={t("accounts")} action={<Link to="/accounts" className="link">{t("navAccounts")} →</Link>}>
-          <ul className="list">
-            {data.accounts
-              .filter((a) => !a.archived || a.balanceCents !== 0)
-              .map((a) => (
-                <li key={a.id} className="list-row static">
-                  <span>{a.name}</span>
-                  <Money cents={a.balanceCents} signed={a.balanceCents < 0} />
-                </li>
-              ))}
-            <li className="list-row static">
-              <strong>{t("totalAccounts")}</strong>
-              <strong>
-                <Money cents={data.accounts.reduce((x, a) => x + a.balanceCents, 0)} />
-              </strong>
-            </li>
-          </ul>
-        </Section>
-      )}
-
-      {data.elapsedDays > 0 && (
-        <Section title={t("tips")}>
-          {data.tips.length === 0 ? (
-            <p className="muted">{t("noTips")}</p>
+      {(data.todo.length > 0 || data.available) && (
+        <Section title={t("toDo")}>
+          {data.todo.length === 0 ? (
+            <p className="muted">{t("allDone")}</p>
           ) : (
-            <ul className="tips">
-              {data.tips.map((tip, i) => (
-                <TipItem key={i} tip={tip} />
+            <ul className="tips todo">
+              {data.todo.map((item, i) => (
+                <TodoItem key={i} item={item} />
               ))}
             </ul>
           )}
         </Section>
       )}
 
-      {data.elapsedDays > 0 && (
-        <Section title={t("spendingOverMonth")}>
-          <SpendingChart data={data} />
+      <div className="overview-grid">
+        {data.elapsedDays > 0 && (
+          <Section title={t(inProgress ? "monthPace" : "monthPacePast")}>
+            {s.plannedExpenseCents > 0 && (
+              <div>
+                <div className="pace" role="presentation">
+                  <div className={`pace-fill ${spentPct > 100 ? "over" : ""}`} style={{ width: `${Math.min(100, spentPct)}%` }} />
+                  {inProgress && <div className="pace-today" style={{ left: `${elapsedPct}%` }} />}
+                </div>
+                <div className="bar-label small pace-label">
+                  <span>
+                    {t("spentPace", { spent: money(s.totalExpenseCents, lang), planned: money(s.plannedExpenseCents, lang), pct: spentPct })}
+                  </span>
+                  {inProgress && <span className="muted">{t("monthElapsed", { pct: elapsedPct })}</span>}
+                </div>
+              </div>
+            )}
+            {projected != null && (
+              <p className="muted small projection">
+                {projectedOver > 0
+                  ? t("projectionOver", { amount: money(projected, lang), over: money(projectedOver, lang) })
+                  : t("projection", { amount: money(projected, lang) })}
+              </p>
+            )}
+            <SpendingChart data={data} />
+          </Section>
+        )}
+
+        {data.elapsedDays > 0 && (
+          <Section title={t("categoriesWatch")} action={<Link to="/budget" className="link">{t("seeAll")} →</Link>}>
+            <CategoryWatch data={data} />
+          </Section>
+        )}
+
+        <Section title={t("leftPerMonth")} action={<Link to="/balance" className="link">{t("navBalance")} →</Link>}>
+          <LeftChart history={data.history} />
         </Section>
-      )}
 
-      <Section title={t("categoriesChart")} action={<Link to="/budget" className="link">{t("navBudget")} →</Link>}>
-        <CategoryBars lines={s.expenses} />
-      </Section>
-
-      <Section title={t("lastMonths")} action={<Link to="/balance" className="link">{t("navBalance")} →</Link>}>
-        <MonthsChart history={data.history} />
-      </Section>
-
-      {data.pots.length > 0 && (
-        <Section
-          title={t("pots")}
-          action={<Link to="/savings" className="link">{t("navSavings")} →</Link>}
-        >
-          <div className="pot-grid">
-            {data.pots.map((p) => (
-              <PotRing key={p.id} pot={p} />
-            ))}
-          </div>
-        </Section>
-      )}
+        <NetWorthCard data={data} />
+      </div>
 
       {adding && <TransactionForm onClose={() => setAdding(false)} onSaved={reload} />}
     </div>

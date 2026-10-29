@@ -5,7 +5,7 @@ import { api, ApiError } from "../api";
 import { useApp } from "../App";
 import { useI18n } from "../i18n";
 import { dateLabel, money, monthLabel } from "../format";
-import { Loading, Modal, Money, MoneyField, MonthNav, Section, useLoad } from "../components";
+import { Loading, Modal, Money, MoneyField, MonthNav, ScheduledHint, ScheduledTag, Section, useLoad } from "../components";
 import { todayISO } from "../../shared/period";
 import type { Account, Transfer, TransferNeed, TransferPlan } from "../../shared/types";
 
@@ -177,6 +177,7 @@ function TransferForm({
           <span>{t("date")}</span>
           <input type="date" required value={date} onChange={(e) => setDate(e.target.value)} />
         </label>
+        <ScheduledHint date={date} />
         <label className="field">
           <span>{t("note")}</span>
           <input maxLength={200} value={note} onChange={(e) => setNote(e.target.value)} />
@@ -246,6 +247,7 @@ function ConfirmTransferForm({
           <span>{t("date")}</span>
           <input type="date" required value={date} onChange={(e) => setDate(e.target.value)} />
         </label>
+        <ScheduledHint date={date} />
         <label className="field">
           <span>{t("note")}</span>
           <input maxLength={200} value={note} onChange={(e) => setNote(e.target.value)} />
@@ -442,6 +444,7 @@ export default function Accounts() {
                     <span className="muted small">
                       {dateLabel(x.date, lang)}
                       {x.note ? ` · ${x.note}` : ""}
+                      {x.scheduled && <ScheduledTag date={x.date} />}
                     </span>
                   </div>
                   <Money cents={x.amountCents} />

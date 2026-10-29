@@ -12,74 +12,65 @@ const TODAY = "2026-10-31"; // already November's budget month
 
 function setup() {
   const db = openDb(":memory:");
-  const account = store.listAccounts(db)[0].id;
   const salary = store.upsertCategory(db, { kind: "income", name: "Salário", plannedCents: 0, sort: 0, archived: false }).id;
   const food = store.upsertCategory(db, { kind: "expense", name: "Supermercado", plannedCents: 0, sort: 0, archived: false }).id;
   store.saveTransaction(db, { kind: "income", date: "2026-09-30", amountCents: 150000, description: "", categoryId: salary });
   store.saveTransaction(db, { kind: "expense", date: "2026-10-05", amountCents: 100000, description: "", categoryId: food });
-  const pot = store.savePot(db, { name: "Férias", goalCents: 0, sort: 0 });
-  return { db, account, food, pot };
+  return { db, food };
 }
 
-const close = (db: ReturnType<typeof openDb>, input: Partial<Parameters<typeof closeMonth>[1]>) =>
-  closeMonth(db, { month: "2026-10", action: "carry", potId: null, potCents: 0, accountId: null, balances: [], ...input }, TODAY);
-
-test("a leftover goes partly into a pot and the rest on to the next month; balances follow the bank", () => {
-  const { db, account, pot } = setup();
-  const before = monthSummary(db, "2026-10", TODAY);
-  assert.equal(before.balanceCents, 50000);
-  assert.equal(before.canClose, true);
+test("closing a month keeps its balance, checks the accounts against the bank and moves nothing", () => {
+  const { db } = setup();
+  const accountBefore = store.listAccounts(db)[0].balanceCents;
+  assert.equal(monthSummary(db, "2026-10", TODAY).canClose, true);
   assert.equal(monthSummary(db, "2026-11", TODAY).previousOpen, "2026-10");
 
-  const c = close(db, { action: "pot", potId: pot, potCents: 30000, accountId: account, balances: [{ accountId: account, bankCents: 50500 }] });
+  const account = store.listAccounts(db)[0].id;
+  const c = closeMonth(db, "2026-10", [{ accountId: account, bankCents: accountBefore + 500 }], TODAY);
   assert.equal(c.balanceCents, 50000);
-  assert.equal(c.potCents, 30000);
-  assert.equal(c.carryCents, 20000);
   assert.deepEqual(c.adjustments.map((a) => a.amountCents), [500]);
 
-  // The deposit is on October's last day, so it counts as October's savings.
   const oct = monthSummary(db, "2026-10", TODAY);
-  assert.equal(oct.savingsCents, 30000);
-  assert.equal(oct.balanceCents, 20000);
+  assert.equal(oct.balanceCents, 50000);
   assert.equal(oct.canClose, false);
-  assert.equal(oct.canReopen, true);
+  assert.deepEqual(oct.close, c);
+  // The next month starts from its own entries; the money is already in the accounts.
   const nov = monthSummary(db, "2026-11", TODAY);
-  assert.equal(nov.carriedInCents, 20000);
-  assert.equal(nov.balanceCents, 20000);
+  assert.equal(nov.balanceCents, 0);
   assert.equal(nov.previousOpen, null);
-  assert.equal(planGrid(db, "2026-11", 1, TODAY).months[0].endCents, 20000);
-  assert.equal(store.listPots(db)[0].balanceCents, 30000);
-  assert.equal(store.listAccounts(db)[0].balanceCents, 50500 - 30000);
+  assert.equal(planGrid(db, "2026-11", 1, TODAY).months[0].endCents, 0);
+  // Only the bank check changes the account; the leftover stays where it is.
+  assert.equal(store.listAccounts(db)[0].balanceCents, accountBefore + 500);
+  assert.equal(store.listMovements(db).length, 0);
 
+  // Reopening unlocks the month; the balance still matches the bank.
   reopenMonth(db, "2026-10");
-  assert.equal(store.listPots(db)[0].balanceCents, 0);
-  assert.equal(store.listAccounts(db)[0].balanceCents, 50000);
-  assert.equal(monthSummary(db, "2026-11", TODAY).carriedInCents, 0);
-  assert.equal(monthSummary(db, "2026-10", TODAY).balanceCents, 50000);
+  assert.equal(monthSummary(db, "2026-10", TODAY).close, null);
+  assert.equal(store.listAccounts(db)[0].balanceCents, accountBefore + 500);
 });
 
-test("a shortfall is carried, or covered from a pot that has enough", () => {
-  const { db, food, pot } = setup();
-  store.saveTransaction(db, { kind: "expense", date: "2026-10-20", amountCents: 60000, description: "", categoryId: food });
-  store.saveMovement(db, { potId: pot, date: "2026-09-01", amountCents: 5000, place: "", note: "", opening: false });
-  assert.throws(() => close(db, { action: "pot", potId: pot, potCents: 10000 }), CloseError);
-  const c = close(db, { action: "pot", potId: pot, potCents: 4000 });
-  assert.equal(c.balanceCents, -10000);
-  assert.equal(c.carryCents, -6000);
-  assert.equal(store.listPots(db)[0].balanceCents, 1000);
-  assert.equal(monthSummary(db, "2026-11", TODAY).balanceCents, -6000);
-});
-
-test("only past months can be closed, and only the last closed month reopened", () => {
+test("only past months can be closed, and any closed month can be reopened", () => {
   const { db } = setup();
-  assert.throws(() => close(db, { month: "2026-11" }), CloseError);
-  close(db, { month: "2026-09", action: "none" });
-  close(db, {});
-  assert.throws(() => close(db, {}), CloseError);
-  assert.throws(() => reopenMonth(db, "2026-09"), CloseError);
-  assert.equal(monthSummary(db, "2026-09", TODAY).canReopen, false);
-  reopenMonth(db, "2026-10");
+  assert.throws(() => closeMonth(db, "2026-11", [], TODAY), CloseError);
+  closeMonth(db, "2026-09", [], TODAY);
+  closeMonth(db, "2026-10", [], TODAY);
+  assert.throws(() => closeMonth(db, "2026-10", [], TODAY), CloseError);
   reopenMonth(db, "2026-09");
+  assert.throws(() => reopenMonth(db, "2026-09"), CloseError);
+});
+
+test("reopening a month closed by the old version keeps its pot money and balance adjustments", () => {
+  const { db } = setup();
+  const account = store.listAccounts(db)[0];
+  const pot = store.savePot(db, { name: "Férias", goalCents: 0, sort: 0 });
+  const movement = store.saveMovement(db, { potId: pot, date: "2026-10-29", amountCents: 20000, place: "", note: "", opening: false });
+  db.prepare("INSERT INTO month_closes (month, closed_at, balance_cents, action, pot_id, pot_cents, movement_id, carry_cents) VALUES ('2026-10', ?, 50000, 'pot', ?, 20000, ?, 30000)").run(TODAY, pot, movement);
+  db.prepare("INSERT INTO account_adjustments (account_id, date, amount_cents, close_month) VALUES (?, ?, 500, '2026-10')").run(account.id, TODAY);
+  // The old carry no longer counts in November.
+  assert.equal(monthSummary(db, "2026-11", TODAY).balanceCents, 0);
+  reopenMonth(db, "2026-10");
+  assert.equal(store.listPots(db)[0].balanceCents, 20000);
+  assert.equal(store.listAccounts(db)[0].balanceCents, account.balanceCents + 500);
 });
 
 test("entries dated in a closed month can't be added, changed or deleted", async () => {
@@ -95,7 +86,7 @@ test("entries dated in a closed month can't be added, changed or deleted", async
 
     // September is a past month whatever day the test runs.
     store.saveTransaction(db, { kind: "expense", date: "2026-09-10", amountCents: 100, description: "", categoryId: food });
-    const closed = await post("/month-close", { month: "2026-09", action: "carry", balances: [] });
+    const closed = await post("/month-close", { month: "2026-09" });
     assert.equal(closed.status, 200);
 
     const refused = await expense("2026-09-10");
